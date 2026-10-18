@@ -11,6 +11,8 @@ Run locally with::
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,6 +21,7 @@ from app import __version__
 from app.api.v1.router import api_router
 from app.core.config import Settings, get_settings
 from app.core.errors import register_exception_handlers
+from app.db.session import Database
 from app.schemas.health import RootResponse
 
 logger = logging.getLogger(__name__)
@@ -28,6 +31,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     """Build and return a configured FastAPI application."""
     settings = settings or get_settings()
 
+    # The database instance is created per application so tests can supply an
+    # isolated database through their own settings.
+    database = Database(settings.database_url, echo=settings.db_echo)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        logger.info("Database engine ready (%s)", settings.database_url)
+        try:
+            yield
+        finally:
+            database.dispose()
+            logger.info("Database engine disposed")
+
     app = FastAPI(
         title=settings.app_name,
         version=settings.app_version or __version__,
@@ -36,10 +52,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         redoc_url="/redoc",
         openapi_url="/openapi.json",
         debug=settings.app_debug,
+        lifespan=lifespan,
     )
 
-    # Expose the resolved settings to dependencies via `app.state`.
+    # Expose shared resources to dependencies via `app.state`.
     app.state.settings = settings
+    app.state.database = database
 
     if settings.cors_origins:
         app.add_middleware(

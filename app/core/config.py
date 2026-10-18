@@ -44,6 +44,16 @@ class Settings(BaseSettings):
     host: str = Field(default="127.0.0.1", description="Bind host for the ASGI server.")
     port: int = Field(default=8000, ge=1, le=65535, description="Bind port for the ASGI server.")
 
+    # --- Database ---
+    # A SQLAlchemy URL. SQLite is the default; swapping this value for a
+    # PostgreSQL URL (e.g. ``postgresql+psycopg://user:pass@host/db``) is the
+    # only change required to move to PostgreSQL later on.
+    database_url: str = Field(
+        default="sqlite:///./messenger.db",
+        description="SQLAlchemy database URL.",
+    )
+    db_echo: bool = Field(default=False, description="Log every SQL statement.")
+
     # --- CORS ---
     cors_origins: list[str] = Field(
         default_factory=list,
@@ -66,6 +76,21 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             return [origin.strip() for origin in value.split(",") if origin.strip()]
         return value
+
+    @field_validator("database_url")
+    @classmethod
+    def _normalise_database_url(cls, value: str) -> str:
+        """Reject an empty URL and accept common shorthand for PostgreSQL."""
+        url = value.strip()
+        if not url:
+            raise ValueError("database_url must not be empty")
+        # ``postgres://`` is emitted by some hosting providers but SQLAlchemy
+        # only understands ``postgresql://``.
+        if url.startswith("postgres://"):
+            url = "postgresql+psycopg://" + url[len("postgres://") :]
+        elif url.startswith("postgresql://"):
+            url = "postgresql+psycopg://" + url[len("postgresql://") :]
+        return url
 
 
 @lru_cache
