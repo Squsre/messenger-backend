@@ -10,6 +10,9 @@ Routes (all under ``/api/v1/auth``):
 
 from __future__ import annotations
 
+import logging
+import uuid
+
 from fastapi import APIRouter, Depends, Request, status
 from sqlalchemy.orm import Session
 
@@ -20,8 +23,14 @@ from app.core.security import AccessTokenClaims, access_token_ttl_seconds, creat
 from app.db.models import User
 from app.db.session import get_db
 from app.schemas.auth import LoginRequest, MessageResponse, TokenResponse, UserCreate, UserRead
+from app.services import verification as verification_service
+from app.services.email import EmailService
+from app.services.profile import touch_last_seen
+from app.services.session import get_session, record_session, revoke_session
 from app.services.token import prune_expired_tokens, revoke_token
 from app.services.user import authenticate_user, create_user
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -101,9 +110,36 @@ _RATE_LIMIT_RESPONSE = {
     ),
     responses={409: _CONFLICT_RESPONSE, 422: _VALIDATION_RESPONSE},
 )
-def register(payload: UserCreate, db: Session = Depends(get_db)) -> User:
-    """Create an account and return its public representation."""
-    return create_user(db, email=payload.email, password=payload.password)
+def register(
+    payload: UserCreate,
+    request: Request,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_app_settings),
+    email_service: EmailService = Depends(deps.get_email_service),
+) -> User:
+    """Create an account and return its public representation.
+
+    A verification email is sent opportunistically. Delivery problems are logged
+    and swallowed: registration must not fail because the mail transport is
+    unavailable, and the link can always be requested again.
+    """
+    user = create_user(db, email=payload.email, password=payload.password)
+
+    try:
+        # The savepoint keeps a delivery failure from discarding the new account.
+        with db.begin_nested():
+            verification_service.issue_email_verification(
+                db,
+                user=user,
+                settings=settings,
+                email_service=email_service,
+            )
+    except Exception:  # pragma: no cover - depends on the transport
+        logger.exception(
+            "Could not send the initial verification email for user id=%s", user.id
+        )
+
+    return user
 
 
 @router.post(
@@ -135,7 +171,26 @@ def login(
     # Opportunistic cleanup so the denylist does not grow forever.
     prune_expired_tokens(db)
 
-    token, _ = create_access_token(user.id, settings=settings)
+    # The session id *is* the token id, so the device can be listed and revoked
+    # without storing the token or any other secret.
+    session_id = uuid.uuid4().hex
+    token, expires_at = create_access_token(
+        user.id,
+        settings=settings,
+        version=user.token_version,
+        jti=session_id,
+    )
+    record_session(
+        db,
+        user=user,
+        session_id=session_id,
+        expires_at=expires_at,
+        user_agent=request.headers.get("user-agent"),
+        ip_address=deps.get_client_ip(request) if settings.session_store_ip else None,
+    )
+    # A login always counts as activity.
+    touch_last_seen(db, user, interval_seconds=0)
+
     return TokenResponse(
         access_token=token,
         expires_in=access_token_ttl_seconds(settings),
@@ -169,6 +224,13 @@ def logout(
     claims: AccessTokenClaims = Depends(deps.get_token_claims),
     db: Session = Depends(get_db),
 ) -> MessageResponse:
-    """Revoke the current access token."""
+    """Revoke the current access token and close its device session."""
     revoke_token(db, claims, user_id=claims.subject_id)
+
+    # Tokens issued before device sessions existed have no row; the denylist
+    # entry above still revokes them.
+    session = get_session(db, session_id=claims.jti)
+    if session is not None and not session.is_revoked:
+        revoke_session(db, session=session)
+
     return MessageResponse(message="Successfully logged out.")

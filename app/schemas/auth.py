@@ -58,6 +58,13 @@ class UserRead(BaseModel):
 
     id: int
     email: EmailStr
+    username: str = Field(
+        description=(
+            "Unique handle, derived from the email at registration and changeable "
+            "through PATCH /api/v1/users/me."
+        ),
+        examples=["alice"],
+    )
     is_active: bool
     created_at: datetime
 

@@ -21,7 +21,9 @@ defaults to the process-wide cached settings.
 
 from __future__ import annotations
 
+import hashlib
 import re
+import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -72,6 +74,101 @@ def validate_password_policy(password: str) -> str:
     if not all(checks):
         raise PasswordPolicyError(_PASSWORD_POLICY)
     return password
+
+
+# --- Username and profile-field policy -------------------------------------
+
+USERNAME_MIN_LENGTH = 3
+USERNAME_MAX_LENGTH = 32
+DISPLAY_NAME_MAX_LENGTH = 64
+BIO_MAX_LENGTH = 280
+AVATAR_KEY_MAX_LENGTH = 255
+
+# Usernames are stored lower-cased and restricted to a portable character set.
+# Lower-casing at the boundary makes uniqueness case-insensitive identically on
+# SQLite and PostgreSQL, so a plain unique index is enough. The first character
+# must be alphanumeric so handles cannot look like internal markers (``_x``).
+USERNAME_PATTERN = re.compile(
+    rf"^[a-z0-9][a-z0-9_]{{{USERNAME_MIN_LENGTH - 1},{USERNAME_MAX_LENGTH - 1}}}$"
+)
+
+# Names that would collide with API routes or be confusing in URLs.
+RESERVED_USERNAMES = frozenset(
+    {
+        "admin",
+        "administrator",
+        "anonymous",
+        "api",
+        "auth",
+        "block",
+        "blocks",
+        "contact",
+        "contacts",
+        "docs",
+        "help",
+        "login",
+        "logout",
+        "me",
+        "moderator",
+        "openapi",
+        "redoc",
+        "register",
+        "root",
+        "search",
+        "security",
+        "settings",
+        "signup",
+        "support",
+        "system",
+        "user",
+        "users",
+    }
+)
+
+_USERNAME_POLICY = (
+    f"Username must be {USERNAME_MIN_LENGTH}-{USERNAME_MAX_LENGTH} characters, start with a "
+    "letter or digit, and contain only lowercase letters, digits and underscores."
+)
+
+# Opaque object-storage key: ``<namespace>/<owner-id>/<uuid>.<extension>``.
+# Deliberately strict so an arbitrary URL or traversal sequence cannot be stored.
+AVATAR_KEY_PATTERN = re.compile(
+    rf"^avatars/[1-9][0-9]*/[0-9a-f]{{32}}\.(png|jpe?g|webp|gif)$"
+)
+
+
+class UsernamePolicyError(ValueError):
+    """Raised when a username does not satisfy the documented policy."""
+
+
+def normalize_username(value: str) -> str:
+    """Return the canonical form of a username (trimmed and lower-cased)."""
+    return value.strip().lower()
+
+
+def validate_username(value: str) -> str:
+    """Return the normalised username if it is acceptable, otherwise raise."""
+    if not isinstance(value, str):
+        raise UsernamePolicyError(_USERNAME_POLICY)
+
+    username = normalize_username(value)
+    if not USERNAME_PATTERN.match(username):
+        raise UsernamePolicyError(_USERNAME_POLICY)
+    if username in RESERVED_USERNAMES:
+        raise UsernamePolicyError("That username is reserved.")
+    return username
+
+
+def validate_avatar_key(value: str) -> str:
+    """Validate a server-issued avatar object key.
+
+    Users never submit this value directly; it is produced by the (future)
+    upload service. The strict pattern keeps arbitrary URLs, path traversal and
+    unsupported formats out of the database.
+    """
+    if not isinstance(value, str) or not AVATAR_KEY_PATTERN.match(value):
+        raise ValueError("Invalid avatar key.")
+    return value
 
 
 # --- Argon2id hashing -------------------------------------------------------
@@ -141,6 +238,10 @@ class AccessTokenClaims:
     issued_at: datetime
     expires_at: datetime
     token_type: str
+    # Matches ``User.token_version`` at issue time. Tokens minted before this
+    # claim existed carry version 0, which is the column default, so they keep
+    # working until the version is deliberately bumped.
+    version: int = 0
 
     @property
     def subject_id(self) -> int | None:
@@ -161,10 +262,15 @@ def create_access_token(
     settings: Settings | None = None,
     expires_delta: timedelta | None = None,
     now: datetime | None = None,
+    version: int = 0,
+    jti: str | None = None,
 ) -> tuple[str, datetime]:
     """Create a signed access token.
 
     Returns the encoded token and its expiry (UTC, timezone-aware).
+
+    ``jti`` may be supplied so the caller can record the session id *before*
+    issuing the token (login stores it on the device session row).
     """
     config = _resolved(settings)
     issued_at = now or datetime.now(timezone.utc)
@@ -173,13 +279,14 @@ def create_access_token(
 
     payload = {
         "sub": str(subject),
-        "jti": uuid.uuid4().hex,
+        "jti": jti or uuid.uuid4().hex,
         "iat": int(issued_at.timestamp()),
         "nbf": int(issued_at.timestamp()),
         "exp": int(expires_at.timestamp()),
         "iss": config.jwt_issuer,
         "aud": config.jwt_audience,
         "type": "access",
+        "ver": int(version),
     }
 
     token = jwt.encode(
@@ -220,6 +327,7 @@ def decode_access_token(token: str, *, settings: Settings | None = None) -> Acce
             issued_at=datetime.fromtimestamp(int(payload["iat"]), tz=timezone.utc),
             expires_at=datetime.fromtimestamp(int(payload["exp"]), tz=timezone.utc),
             token_type=str(payload["type"]),
+            version=int(payload.get("ver", 0)),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise TokenError("Could not validate credentials.") from exc
@@ -228,3 +336,28 @@ def decode_access_token(token: str, *, settings: Settings | None = None) -> Acce
 def access_token_ttl_seconds(settings: Settings | None = None) -> int:
     """Lifetime of a newly issued access token, in seconds."""
     return _resolved(settings).access_token_expire_minutes * 60
+
+
+# --- Opaque, single-use tokens (email verification, password reset) ---------
+
+#: Number of random bytes behind every opaque token.
+OPAQUE_TOKEN_BYTES = 32
+
+
+def generate_opaque_token() -> str:
+    """Return a fresh, high-entropy URL-safe token.
+
+    Used for email-verification and password-reset links. The raw value is only
+    ever handed to the email service; the database stores a digest.
+    """
+    return secrets.token_urlsafe(OPAQUE_TOKEN_BYTES)
+
+
+def hash_opaque_token(token: str) -> str:
+    """Return the hex SHA-256 digest stored in the database.
+
+    A fast hash is the right tool here (unlike passwords): the token already has
+    256 bits of entropy, so there is nothing to brute force, and lookups by
+    digest must stay cheap.
+    """
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()

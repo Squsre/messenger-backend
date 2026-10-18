@@ -66,6 +66,13 @@ class ForbiddenError(AppError):
     code = "forbidden"
 
 
+class BadRequestError(AppError):
+    """Raised when a request is well-formed but the action cannot be performed."""
+
+    status_code = status.HTTP_400_BAD_REQUEST
+    code = "bad_request"
+
+
 class ConflictError(AppError):
     """Raised when a resource already exists (for example a duplicate email)."""
 

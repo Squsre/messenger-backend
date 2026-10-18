@@ -22,24 +22,56 @@ def is_token_revoked(db: Session, jti: str) -> bool:
     return db.execute(statement).scalar_one_or_none() is not None
 
 
+def blocklist_token_id(
+    db: Session,
+    *,
+    jti: str,
+    expires_at: datetime,
+    user_id: int | None = None,
+    token_type: str = "access",
+) -> None:
+    """Add a token id to the denylist.
+
+    Idempotent: revoking the same token twice is not an error. Used directly by
+    "log out everywhere"/single-session revocation, which know the ``jti`` of
+    each session but no longer hold its claims object.
+
+    The insert runs inside a ``SAVEPOINT`` and the row is added *after* it opens,
+    so a lost race (another request inserted the same ``jti`` first) rolls back
+    only this insert and leaves the caller's pending changes — such as a
+    ``token_version`` bump — intact.
+    """
+    if is_token_revoked(db, jti):
+        return
+
+    try:
+        with db.begin_nested():
+            db.add(
+                TokenBlocklist(
+                    jti=jti,
+                    user_id=user_id,
+                    token_type=token_type,
+                    expires_at=expires_at,
+                )
+            )
+            db.flush()
+    except IntegrityError:
+        # Already revoked (or a concurrent logout); that is fine.
+        pass
+
+
 def revoke_token(db: Session, claims: AccessTokenClaims, *, user_id: int | None = None) -> None:
-    """Add a token to the denylist.
+    """Add a verified token's id to the denylist.
 
     Idempotent: revoking the same token twice is not an error.
     """
-    db.add(
-        TokenBlocklist(
-            jti=claims.jti,
-            user_id=user_id,
-            token_type=claims.token_type,
-            expires_at=claims.expires_at,
-        )
+    blocklist_token_id(
+        db,
+        jti=claims.jti,
+        expires_at=claims.expires_at,
+        user_id=user_id,
+        token_type=claims.token_type,
     )
-    try:
-        db.flush()
-    except IntegrityError:
-        # Already revoked (or a concurrent logout); that is fine.
-        db.rollback()
 
 
 def prune_expired_tokens(db: Session, *, now: datetime | None = None) -> int:

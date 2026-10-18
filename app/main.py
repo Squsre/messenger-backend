@@ -24,6 +24,7 @@ from app.core.errors import register_exception_handlers
 from app.core.rate_limit import SlidingWindowRateLimiter
 from app.db.session import Database
 from app.schemas.health import RootResponse
+from app.services.email import build_email_service
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,25 @@ OPENAPI_TAGS = [
     {
         "name": "auth",
         "description": "Registration, login, current user and logout.",
+    },
+    {
+        "name": "account",
+        "description": (
+            "Account security: email verification, password change and reset, "
+            "and device session management."
+        ),
+    },
+    {
+        "name": "users",
+        "description": "Profiles, privacy settings and user search.",
+    },
+    {
+        "name": "contacts",
+        "description": "One-directional contact lists.",
+    },
+    {
+        "name": "blocks",
+        "description": "Blocking users; enforced across profiles, search and contacts.",
     },
 ]
 
@@ -56,6 +76,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         max_requests=settings.login_rate_limit_attempts,
         window_seconds=settings.login_rate_limit_window_seconds,
     )
+
+    # One limiter per scope: a noisy feature (say search) cannot spend another
+    # feature's budget. "login" keeps its historical attribute below as well.
+    rate_limiters: dict[str, SlidingWindowRateLimiter] = {
+        "login": login_rate_limiter,
+        "email_verification": SlidingWindowRateLimiter(
+            max_requests=settings.email_rate_limit_attempts,
+            window_seconds=settings.email_rate_limit_window_seconds,
+        ),
+        "email_verify_confirm": SlidingWindowRateLimiter(
+            max_requests=settings.email_rate_limit_attempts,
+            window_seconds=settings.email_rate_limit_window_seconds,
+        ),
+        "password_reset": SlidingWindowRateLimiter(
+            max_requests=settings.password_reset_rate_limit_attempts,
+            window_seconds=settings.password_reset_rate_limit_window_seconds,
+        ),
+        "password_reset_confirm": SlidingWindowRateLimiter(
+            max_requests=settings.password_reset_rate_limit_attempts,
+            window_seconds=settings.password_reset_rate_limit_window_seconds,
+        ),
+        "search": SlidingWindowRateLimiter(
+            max_requests=settings.search_rate_limit_attempts,
+            window_seconds=settings.search_rate_limit_window_seconds,
+        ),
+        "contact": SlidingWindowRateLimiter(
+            max_requests=settings.contact_rate_limit_attempts,
+            window_seconds=settings.contact_rate_limit_window_seconds,
+        ),
+    }
+
+    email_service = build_email_service(settings)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -82,6 +134,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     app.state.database = database
     app.state.login_rate_limiter = login_rate_limiter
+    app.state.rate_limiters = rate_limiters
+    app.state.email_service = email_service
 
     if settings.cors_origins:
         # ``allow_credentials`` stays off: authentication uses Bearer tokens,

@@ -29,6 +29,9 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 # RSA/HMAC confusion attack.
 ALLOWED_JWT_ALGORITHMS: frozenset[str] = frozenset({"HS256", "HS384", "HS512"})
 
+# Email delivery backends. ``console`` is development-only.
+ALLOWED_EMAIL_BACKENDS: frozenset[str] = frozenset({"console", "smtp", "disabled"})
+
 # Substrings that identify the throw-away placeholder shipped in `.env.example`.
 # They are rejected outside local development so an insecure secret cannot reach
 # a real environment by accident.
@@ -93,6 +96,12 @@ class Settings(DatabaseSettings):
 
     # --- API ---
     api_v1_prefix: str = Field(default="/api/v1", description="Prefix for version 1 endpoints.")
+    # Used to build the links sent by email (verification / password reset).
+    # It points at the *client*, not necessarily this service.
+    public_base_url: str = Field(
+        default="http://localhost:8000",
+        description="Public base URL used when composing links sent to users.",
+    )
 
     # --- Server ---
     host: str = Field(default="127.0.0.1", description="Bind host for the ASGI server.")
@@ -130,6 +139,55 @@ class Settings(DatabaseSettings):
         description="Length of the login rate-limit window in seconds.",
     )
 
+    # --- Profiles ---
+    # How often ``last_seen_at`` may be refreshed by an authenticated request.
+    last_seen_update_interval_seconds: int = Field(default=60, ge=0)
+    # Whether login records the client IP on the device session. The IP is only
+    # ever shown back to the account owner; switch this off where storing it is
+    # not permitted.
+    session_store_ip: bool = Field(default=True)
+
+    # --- User search ---
+    search_min_query_length: int = Field(
+        default=2,
+        ge=1,
+        le=32,
+        description="Shortest accepted search term (prevents wide scans).",
+    )
+    search_default_limit: int = Field(default=20, ge=1, le=100)
+    search_max_limit: int = Field(default=50, ge=1, le=100)
+
+    # --- Email delivery ---
+    # ``console`` writes messages to EMAIL_OUTBOX_DIR (development only),
+    # ``smtp`` sends over the network, ``disabled`` drops them.
+    email_backend: str = Field(default="console", description="console | smtp | disabled")
+    email_from: str = Field(default="no-reply@messenger.local")
+    email_outbox_dir: str = Field(
+        default="var/outbox",
+        description="Where the console backend writes rendered messages.",
+    )
+    email_verification_token_expire_minutes: int = Field(default=1440, ge=1)
+    password_reset_token_expire_minutes: int = Field(default=30, ge=1)
+
+    # SMTP (only used when EMAIL_BACKEND=smtp)
+    smtp_host: str = Field(default="")
+    smtp_port: int = Field(default=587, ge=1, le=65535)
+    smtp_username: str = Field(default="")
+    smtp_password: SecretStr = Field(default=SecretStr(""))
+    smtp_use_tls: bool = Field(default=True)
+
+    # --- Per-scope rate limits -------------------------------------------------
+    # Account-security and lookup endpoints get their own throttle so one noisy
+    # feature cannot exhaust another's budget.
+    email_rate_limit_attempts: int = Field(default=3, ge=1)
+    email_rate_limit_window_seconds: int = Field(default=3600, ge=1)
+    password_reset_rate_limit_attempts: int = Field(default=5, ge=1)
+    password_reset_rate_limit_window_seconds: int = Field(default=3600, ge=1)
+    search_rate_limit_attempts: int = Field(default=60, ge=1)
+    search_rate_limit_window_seconds: int = Field(default=60, ge=1)
+    contact_rate_limit_attempts: int = Field(default=30, ge=1)
+    contact_rate_limit_window_seconds: int = Field(default=60, ge=1)
+
     # --- CORS ---
     # ``NoDecode`` keeps pydantic-settings from JSON-decoding the value, so a
     # plain comma-separated list in `.env` works.
@@ -164,6 +222,23 @@ class Settings(DatabaseSettings):
             allowed = ", ".join(sorted(ALLOWED_JWT_ALGORITHMS))
             raise ValueError(f"jwt_algorithm must be one of: {allowed}")
         return algorithm
+
+    @field_validator("email_backend")
+    @classmethod
+    def _validate_email_backend(cls, value: str, info: ValidationInfo) -> str:
+        """Restrict the backend and forbid the development one in production."""
+        backend = value.strip().lower()
+        if backend not in ALLOWED_EMAIL_BACKENDS:
+            allowed = ", ".join(sorted(ALLOWED_EMAIL_BACKENDS))
+            raise ValueError(f"email_backend must be one of: {allowed}")
+
+        environment = str(info.data.get("app_env", "development")).lower()
+        if backend == "console" and environment not in _LOCAL_ENVIRONMENTS:
+            raise ValueError(
+                "email_backend='console' is a development-only backend and is not "
+                "allowed outside local environments"
+            )
+        return backend
 
     @field_validator("jwt_secret_key")
     @classmethod

@@ -1,12 +1,23 @@
-"""Reusable FastAPI dependencies for authentication and authorisation.
+"""Reusable FastAPI dependencies for authentication, throttling and services.
 
-The chain is:
+The authentication chain is:
 
 ``get_bearer_token`` → ``get_token_claims`` → ``get_current_user`` → ``get_current_active_user``
 
 Endpoints depend on the last one (and get a fully validated, active
 :class:`~app.db.models.User`), while ``get_token_claims`` is used by logout,
 which needs the raw ``jti`` rather than a user.
+
+A token is accepted only when **all** of the following hold:
+
+1. it verifies (signature, algorithm, audience, issuer, expiry, type),
+2. its ``ver`` claim matches ``User.token_version`` — this is how a password
+   change, a password reset or "log out everywhere" kills every older token,
+3. its ``jti`` is not in the server-side denylist (single-session revocation), and
+4. if a device session row exists for the ``jti``, that session is not revoked.
+
+Step 4 tolerates a missing row on purpose: access tokens issued before device
+sessions existed keep working instead of being invalidated by the upgrade.
 """
 
 from __future__ import annotations
@@ -24,6 +35,10 @@ from app.core.rate_limit import SlidingWindowRateLimiter
 from app.core.security import AccessTokenClaims, TokenError, decode_access_token
 from app.db.models import User
 from app.db.session import get_db
+from app.services.email import EmailService, build_email_service
+from app.services.profile import touch_last_seen
+from app.services.session import touch_session
+from app.services.session import get_session as get_device_session
 from app.services.token import is_token_revoked
 from app.services.user import get_user_by_id, normalize_email
 
@@ -63,19 +78,34 @@ def get_token_claims(
 def get_current_user(
     claims: AccessTokenClaims = Depends(get_token_claims),
     db: Session = Depends(get_db),
+    settings: Settings = Depends(get_app_settings),
 ) -> User:
-    """Resolve the authenticated user from the access token."""
-    if is_token_revoked(db, claims.jti):
-        raise UnauthorizedError("Token has been revoked.")
-
-    try:
-        user_id = int(claims.subject)
-    except (TypeError, ValueError) as exc:
-        raise UnauthorizedError("Could not validate credentials.") from exc
+    """Resolve the authenticated user and refresh their activity heartbeat."""
+    user_id = claims.subject_id
+    if user_id is None:
+        raise UnauthorizedError("Could not validate credentials.")
 
     user = get_user_by_id(db, user_id)
     if user is None:
         raise UnauthorizedError("Could not validate credentials.")
+
+    # (2) Global invalidation. Tokens minted before the ``ver`` claim existed
+    # carry 0, which is the column default, so they remain valid until bumped.
+    if claims.version != user.token_version:
+        raise UnauthorizedError("Could not validate credentials.")
+
+    # (3) Single-token revocation (logout, single-device revocation).
+    if is_token_revoked(db, claims.jti):
+        raise UnauthorizedError("Token has been revoked.")
+
+    # (4) Device session state. A missing row means a pre-sessions token.
+    device_session = get_device_session(db, session_id=claims.jti)
+    if device_session is not None:
+        if device_session.is_revoked:
+            raise UnauthorizedError("Token has been revoked.")
+        touch_session(db, device_session, interval_seconds=settings.last_seen_update_interval_seconds)
+
+    touch_last_seen(db, user, interval_seconds=settings.last_seen_update_interval_seconds)
     return user
 
 
@@ -84,6 +114,65 @@ def get_current_active_user(user: User = Depends(get_current_user)) -> User:
     if not user.is_active:
         raise ForbiddenError("This account is disabled.")
     return user
+
+
+# --- shared services --------------------------------------------------------
+
+
+def get_email_service(
+    request: Request,
+    settings: Settings = Depends(get_app_settings),
+) -> EmailService:
+    """Return the configured email transport.
+
+    The application attaches one to ``app.state`` at startup; the fallback keeps
+    ad-hoc app instances (scripts, tests) working.
+    """
+    service = getattr(request.app.state, "email_service", None)
+    return service if service is not None else build_email_service(settings)
+
+
+def get_client_ip(request: Request) -> str | None:
+    """Best-effort client address.
+
+    ``request.client`` is the transport peer, so behind a proxy this is the
+    proxy's address; the README documents how to source the real client IP when
+    a trusted reverse proxy is introduced.
+    """
+    return request.client.host if request.client else None
+
+
+# --- rate limiting ----------------------------------------------------------
+
+
+def get_rate_limiter(request: Request, scope: str) -> SlidingWindowRateLimiter | None:
+    """Return the limiter registered for ``scope``, if any."""
+    registry = getattr(request.app.state, "rate_limiters", None) or {}
+    return registry.get(scope)
+
+
+def enforce_rate_limit(request: Request, settings: Settings, scope: str, *keys: str) -> None:
+    """Throttle a request against the limiter registered for ``scope``.
+
+    Every key is checked and the longest wait wins (so a "per account" and a
+    "per address" rule can be combined). Raises :class:`RateLimitError`
+    (429 + ``Retry-After``) when any key is exhausted.
+    """
+    if not settings.rate_limit_enabled:
+        return
+
+    limiter = get_rate_limiter(request, scope)
+    if limiter is None:
+        return
+
+    retry_after = 0.0
+    for key in keys:
+        allowed, wait = limiter.check(f"{scope}:{key}")
+        if not allowed:
+            retry_after = max(retry_after, wait)
+
+    if retry_after > 0:
+        raise RateLimitError(retry_after=math.ceil(retry_after))
 
 
 def get_login_rate_limiter(request: Request) -> SlidingWindowRateLimiter | None:
@@ -105,7 +194,7 @@ def enforce_login_rate_limit(request: Request, settings: Settings, email: str) -
     if limiter is None:
         return
 
-    client_host = request.client.host if request.client else "unknown"
+    client_host = get_client_ip(request) or "unknown"
     keys = (f"ip:{client_host}", f"email:{normalize_email(email)}")
 
     retry_after = 0.0
