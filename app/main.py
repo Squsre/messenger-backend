@@ -21,10 +21,25 @@ from app import __version__
 from app.api.v1.router import api_router
 from app.core.config import Settings, get_settings
 from app.core.errors import register_exception_handlers
+from app.core.rate_limit import SlidingWindowRateLimiter
 from app.db.session import Database
 from app.schemas.health import RootResponse
 
 logger = logging.getLogger(__name__)
+
+# Methods and headers the API actually uses. Keeping these explicit (instead of
+# ``*``) avoids advertising capabilities the service does not have.
+CORS_ALLOWED_METHODS = ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"]
+CORS_ALLOWED_HEADERS = ["Authorization", "Content-Type", "Accept"]
+
+OPENAPI_TAGS = [
+    {"name": "meta", "description": "Service metadata."},
+    {"name": "health", "description": "Liveness and readiness probes."},
+    {
+        "name": "auth",
+        "description": "Registration, login, current user and logout.",
+    },
+]
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -34,6 +49,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # The database instance is created per application so tests can supply an
     # isolated database through their own settings.
     database = Database(settings.database_url, echo=settings.db_echo)
+
+    # In-process login throttle. See app/core/rate_limit.py for its scope and
+    # limitations (single process; a shared store is needed to scale out).
+    login_rate_limiter = SlidingWindowRateLimiter(
+        max_requests=settings.login_rate_limit_attempts,
+        window_seconds=settings.login_rate_limit_window_seconds,
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -53,19 +75,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_url="/openapi.json",
         debug=settings.app_debug,
         lifespan=lifespan,
+        openapi_tags=OPENAPI_TAGS,
     )
 
     # Expose shared resources to dependencies via `app.state`.
     app.state.settings = settings
     app.state.database = database
+    app.state.login_rate_limiter = login_rate_limiter
 
     if settings.cors_origins:
+        # ``allow_credentials`` stays off: authentication uses Bearer tokens,
+        # not cookies, so browsers never need to send credentials implicitly.
         app.add_middleware(
             CORSMiddleware,
             allow_origins=settings.cors_origins,
-            allow_credentials=True,
-            allow_methods=["*"],
-            allow_headers=["*"],
+            allow_credentials=False,
+            allow_methods=CORS_ALLOWED_METHODS,
+            allow_headers=CORS_ALLOWED_HEADERS,
         )
 
     register_exception_handlers(app)

@@ -1,9 +1,12 @@
 """Centralised error handling for the API.
 
-Two exception handlers are registered on the application:
+Exception handlers registered on the application:
 
-* a dedicated handler for :class:`AppError` (our own, explicit application
-  errors) that renders the error payload declared in the OpenAPI schema, and
+* a handler for :class:`AppError` (our own, explicit application errors) that
+  renders the error payload declared in the OpenAPI schema,
+* a handler for request validation errors that returns the same envelope —
+  **with the submitted values removed**, so passwords and tokens never travel
+  back to the client or into logs, and
 * a catch-all handler so unexpected failures return a consistent JSON body
   instead of a bare HTML traceback.
 """
@@ -26,10 +29,17 @@ class AppError(Exception):
     status_code: int = status.HTTP_400_BAD_REQUEST
     code: str = "app_error"
 
-    def __init__(self, message: str = "Unexpected application error", **details: Any) -> None:
+    def __init__(
+        self,
+        message: str = "Unexpected application error",
+        *,
+        headers: dict[str, str] | None = None,
+        **details: Any,
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.details = details
+        self.headers = headers
 
 
 class NotFoundError(AppError):
@@ -37,6 +47,47 @@ class NotFoundError(AppError):
 
     status_code = status.HTTP_404_NOT_FOUND
     code = "not_found"
+
+
+class UnauthorizedError(AppError):
+    """Raised when credentials are missing, invalid, expired or revoked."""
+
+    status_code = status.HTTP_401_UNAUTHORIZED
+    code = "unauthorized"
+
+    def __init__(self, message: str = "Not authenticated.", **details: Any) -> None:
+        super().__init__(message, headers={"WWW-Authenticate": "Bearer"}, **details)
+
+
+class ForbiddenError(AppError):
+    """Raised when an authenticated user is not allowed to perform an action."""
+
+    status_code = status.HTTP_403_FORBIDDEN
+    code = "forbidden"
+
+
+class ConflictError(AppError):
+    """Raised when a resource already exists (for example a duplicate email)."""
+
+    status_code = status.HTTP_409_CONFLICT
+    code = "conflict"
+
+
+class RateLimitError(AppError):
+    """Raised when a client exceeds an allowed request rate."""
+
+    status_code = status.HTTP_429_TOO_MANY_REQUESTS
+    code = "rate_limited"
+
+    def __init__(
+        self,
+        message: str = "Too many requests. Please try again later.",
+        *,
+        retry_after: int | None = None,
+        **details: Any,
+    ) -> None:
+        headers = {"Retry-After": str(retry_after)} if retry_after is not None else None
+        super().__init__(message, headers=headers, **details)
 
 
 def _error_payload(code: str, message: str, details: Any | None = None) -> dict[str, Any]:
@@ -47,6 +98,24 @@ def _error_payload(code: str, message: str, details: Any | None = None) -> dict[
     return payload
 
 
+def _sanitise_validation_errors(errors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop ``input``/``ctx`` from validation errors.
+
+    Pydantic echoes the offending value in ``input``; for authentication
+    payloads that would mean returning the password in the response body.
+    """
+    safe = []
+    for error in errors:
+        safe.append(
+            {
+                "type": error.get("type"),
+                "loc": list(error.get("loc", ())),
+                "msg": error.get("msg"),
+            }
+        )
+    return safe
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     """Attach all exception handlers to ``app``."""
 
@@ -55,6 +124,7 @@ def register_exception_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=exc.status_code,
             content=_error_payload(exc.code, exc.message, exc.details or None),
+            headers=exc.headers,
         )
 
     @app.exception_handler(RequestValidationError)
@@ -64,7 +134,7 @@ def register_exception_handlers(app: FastAPI) -> None:
             content=_error_payload(
                 "validation_error",
                 "Request validation failed.",
-                details=exc.errors(),
+                details=_sanitise_validation_errors(exc.errors()),
             ),
         )
 

@@ -17,7 +17,7 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
-from app.core.config import get_settings
+from app.core.config import get_database_settings
 from app.db.base import Base
 
 # Importing the models package registers every table on Base.metadata.
@@ -38,7 +38,9 @@ def _resolve_url() -> str:
         return url
     if url := config.get_main_option("sqlalchemy.url"):
         return url
-    return get_settings().database_url
+    # Only needs the database settings, so migrations do not require the
+    # application's JWT secret to be present.
+    return get_database_settings().database_url
 
 
 def run_migrations_offline() -> None:

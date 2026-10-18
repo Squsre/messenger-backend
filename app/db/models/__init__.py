@@ -6,5 +6,7 @@ creating a module in this package and re-exporting it here.
 """
 
 from app.db.models.health_check import HealthCheck
+from app.db.models.token_blocklist import TokenBlocklist
+from app.db.models.user import User
 
-__all__ = ["HealthCheck"]
+__all__ = ["HealthCheck", "TokenBlocklist", "User"]
