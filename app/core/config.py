@@ -157,6 +157,11 @@ class Settings(DatabaseSettings):
     search_default_limit: int = Field(default=20, ge=1, le=100)
     search_max_limit: int = Field(default=50, ge=1, le=100)
 
+    # --- Chat ---
+    # Hard ceilings for one page, regardless of what a client asks for.
+    conversation_max_limit: int = Field(default=50, ge=1, le=100)
+    message_max_limit: int = Field(default=100, ge=1, le=200)
+
     # --- Email delivery ---
     # ``console`` writes messages to EMAIL_OUTBOX_DIR (development only),
     # ``smtp`` sends over the network, ``disabled`` drops them.
@@ -187,6 +192,8 @@ class Settings(DatabaseSettings):
     search_rate_limit_window_seconds: int = Field(default=60, ge=1)
     contact_rate_limit_attempts: int = Field(default=30, ge=1)
     contact_rate_limit_window_seconds: int = Field(default=60, ge=1)
+    chat_rate_limit_attempts: int = Field(default=120, ge=1)
+    chat_rate_limit_window_seconds: int = Field(default=60, ge=1)
 
     # --- CORS ---
     # ``NoDecode`` keeps pydantic-settings from JSON-decoding the value, so a

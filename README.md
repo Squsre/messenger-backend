@@ -10,9 +10,11 @@ Backend for the messenger project, built with **Python 3.11**, **FastAPI** and
 > **Stage 3** — production-ready email/password authentication (register, login, `/me`, logout).
 > **Stage 4–6** — user profiles, account security (email verification, password change/reset,
 > device sessions) and contacts/search/blocks.
+> **Stage 7** — one-to-one private conversations and text messages (HTTP only; no realtime
+> transport yet).
 >
-> Chat, groups, file uploads and E2EE are still to come. Two-factor authentication and
-> contact *requests* are deliberately deferred and documented in the roadmap.
+> Groups, file uploads, realtime delivery and E2EE are still to come. Two-factor authentication
+> and contact *requests* are deliberately deferred and documented in the roadmap.
 
 ## Project layout
 
@@ -37,7 +39,10 @@ messenger/
 │   │       ├── user_session.py  # logged-in devices (id == access-token `jti`)
 │   │       ├── verification_token.py # hashed single-use email/reset tokens
 │   │       ├── contact.py       # one-directional contact relationships
-│   │       └── block.py         # user-to-user blocks
+│   │       ├── block.py         # user-to-user blocks
+│   │       ├── conversation.py  # one-to-one conversations (unique pair_key)
+│   │       ├── conversation_member.py # participants
+│   │       └── message.py       # append-only text messages
 │   ├── services/
 │   │   ├── user.py              # registration, lookup, username derivation
 │   │   ├── profile.py           # profile updates, visibility, last-seen heartbeat
@@ -45,7 +50,8 @@ messenger/
 │   │   ├── session.py           # device sessions, revoke one / all
 │   │   ├── verification.py      # issue + consume email/reset tokens
 │   │   ├── email.py             # EmailService: smtp / console / disabled
-│   │   └── contact.py           # contacts, blocks, user search queries
+│   │   ├── contact.py           # contacts, blocks, user search queries
+│   │   └── chat.py              # conversations, membership, messages
 │   ├── api/
 │   │   ├── deps.py              # token chain, per-scope rate limits, services
 │   │   └── v1/
@@ -56,20 +62,23 @@ messenger/
 │   │           ├── account.py   # /api/v1/auth/{email,password,sessions,logout-all}
 │   │           ├── users.py     # /api/v1/users/{me,search,{username}}
 │   │           ├── contacts.py  # /api/v1/contacts
-│   │           └── blocks.py    # /api/v1/blocks
+│   │           ├── blocks.py    # /api/v1/blocks
+│   │           └── conversations.py # /api/v1/conversations
 │   └── schemas/
 │       ├── health.py            # response models
 │       ├── auth.py              # auth request/response models
 │       ├── user.py              # public vs private profile models
 │       ├── account.py           # verification, password and session models
-│       └── contact.py           # username reference model
+│       ├── contact.py           # username reference model
+│       └── chat.py              # conversation/message request + response models
 ├── migrations/                  # Alembic environment
 │   ├── env.py
 │   ├── script.py.mako
 │   └── versions/
 │       ├── 0001_create_health_checks.py
 │       ├── 0002_create_users_and_token_blocklist.py
-│       └── 0003_add_profiles_and_social.py
+│       ├── 0003_add_profiles_and_social.py
+│       └── 0004_add_conversations_and_messages.py
 ├── tests/
 │   ├── conftest.py              # fixtures + register/login and email helpers
 │   ├── test_app.py              # startup, docs, wiring
@@ -85,7 +94,9 @@ messenger/
 │   ├── test_sessions.py         # device sessions and global invalidation
 │   ├── test_search.py           # search ranking, paging, filtering
 │   ├── test_contacts.py         # one-directional contacts
-│   └── test_blocks.py           # blocks and their cross-feature effects
+│   ├── test_blocks.py           # blocks and their cross-feature effects
+│   ├── test_conversations.py    # conversation creation, idempotency, listing, access
+│   └── test_messages.py         # sending, validation, history, paging, blocks
 ├── alembic.ini
 ├── .env.example
 ├── .gitignore
@@ -134,7 +145,7 @@ SQLite is used by default and lives at `./messenger.db` (configurable through
 The database URL is read from `DATABASE_URL` (via `.env`), so the same commands
 work unchanged after switching to PostgreSQL.
 
-Current head: **`0003_add_profiles_and_social`**. Apply it to an existing
+Current head: **`0004_add_conversations`**. Apply it to an existing
 database (created by an earlier stage) with a single `alembic upgrade head`:
 
 | Revision | What it adds |
@@ -142,6 +153,7 @@ database (created by an earlier stage) with a single `alembic upgrade head`:
 | `0001_create_health_checks` | `health_checks` (infrastructure). |
 | `0002_create_users_and_token_blocklist` | `users`, `token_blocklist` (auth). |
 | `0003_add_profiles_and_social` | Profile/security columns on `users`, plus `user_sessions`, `verification_tokens`, `contacts`, `blocks`. |
+| `0004_add_conversations` | `conversations`, `conversation_members`, `messages` (one-to-one chat). |
 
 `0003` is written to be safe on a database that already contains accounts:
 `users.username` is added **nullable**, every existing account is backfilled
@@ -151,10 +163,14 @@ its unique index. Existing rows, ids and passwords are never rewritten. The
 backfill is deterministic, so downgrading and re-upgrading lands on the same
 names.
 
-> **Rollback warning:** `alembic downgrade -1` (from `0003`) drops the profile,
-> verification and session columns *and their data*. It is safe for a
-> throw-away database and is exercised by the test suite, but do not run it on a
-> production database that has real profile or session data without a backup.
+`0004` only **creates new tables**; it alters nothing that already existed, so it
+is safe on a populated database.
+
+> **Rollback warning:** `alembic downgrade -1` (from `0004`) drops the three chat
+> tables *and the messages they hold*. From `0003` it drops the profile,
+> verification and session columns *and their data*. Both are safe for a
+> throw-away database and are exercised by the test suite, but do not run them on
+> a production database that has real data without a backup.
 
 
 ### Session usage in future endpoints
@@ -508,8 +524,76 @@ users are rejected.
 
 Blocking is deliberately **non-destructive**: it does not delete an existing
 contact relationship, it only hides it from the list, so unblocking restores the
-previous state instead of silently losing data. This model does *not* by itself
-make future messaging safe — the chat phase must apply the same rules again.
+previous state instead of silently losing data. The same rule now applies to
+chat: a block does not delete a conversation or its history, it stops new
+messages in both directions until the block is removed.
+
+## One-to-one chat
+
+| Method | Path                                             | Description                                  |
+| ------ | ------------------------------------------------ | -------------------------------------------- |
+| `POST` | `/api/v1/conversations`                          | Start (or reopen) a conversation by username. |
+| `GET`  | `/api/v1/conversations`                          | Page through my conversations.                |
+| `GET`  | `/api/v1/conversations/{conversation_id}`        | One conversation I belong to.                 |
+| `POST` | `/api/v1/conversations/{conversation_id}/messages` | Send a message.                            |
+| `GET`  | `/api/v1/conversations/{conversation_id}/messages` | Chronological message history (paged).     |
+
+### Conversations
+
+A conversation is always between **exactly two** accounts. Its `pair_key` is the
+canonical `"<lower-id>:<higher-id>"` label of the pair and carries a **unique
+index**, so a duplicate pair cannot exist even when two requests race; the
+service also catches the resulting `IntegrityError` and returns the row that won.
+
+`POST /api/v1/conversations` is **idempotent**:
+
+* `201` — a new conversation was created;
+* `200` — the pair already had one, and the existing conversation is returned.
+
+Repeating the request from either side therefore never creates a second
+conversation. Talking to yourself is a `400`, an unknown or deactivated account
+is a `404`, and a blocked pair is a `403` — the same vocabulary as contacts.
+
+`GET /api/v1/conversations` returns only the caller's conversations, ordered by
+most recent activity (`last_message_at`, falling back to `created_at` when no
+message has been sent). Each item carries the **other** participant as a
+`UserPublic` — so last-seen visibility and the absence of email apply exactly as
+in profiles — plus a preview of the newest message.
+
+### Messages
+
+A message body is plain text, trimmed before storage, **1–4000 characters**
+(`MESSAGE_MAX_LENGTH` in `app/core/security.py`). Empty and whitespace-only
+bodies are `422`, as is any attempt to set `sender_id`/`created_at` (the request
+schema forbids unknown fields). The same limits are enforced by `CHECK`
+constraints on the table, so they hold even if application code is bypassed.
+
+History is returned **oldest first** and is paged with `limit`/`offset`
+(`limit` is capped by `MESSAGE_MAX_LIMIT`). Ordering is by the monotonic message
+`id`, which is both chronological and stable: timestamps can collide within a
+second, ids cannot. Messages are append-only in this phase — there is no edit or
+delete endpoint.
+
+### Authorization and blocks
+
+Every route resolves the conversation through a single membership check. A
+conversation the caller does not participate in returns **`404`, not `403`**, so
+an id cannot be used to discover that a conversation exists. Sending a message
+re-checks the block state because a block can be created *after* the
+conversation exists:
+
+* creating a conversation across a block → `403`;
+* sending while either side has blocked the other → `403`;
+* the existing conversation and its history stay readable to both participants,
+  exactly like contacts survive a block and reappear on unblock.
+
+Chat requests share one per-scope rate limiter (`CHAT_RATE_LIMIT_ATTEMPTS` /
+`CHAT_RATE_LIMIT_WINDOW_SECONDS`), keyed by user id.
+
+The conversation list is built with three queries per page (conversations,
+participants, last messages) instead of one per item, so paging does not turn
+into an N+1. Realtime delivery, read receipts, typing indicators, edits/deletes
+and unread counters are **not** part of this phase; clients poll over HTTP.
 
 ## Run the server
 
@@ -546,15 +630,19 @@ Tests never touch `messenger.db`: each one gets a temporary SQLite file. The
 migration tests run the real `alembic upgrade`/`downgrade` commands against a
 throw-away database and additionally assert that the migrated schema matches
 the ORM models (no drift); they also verify that the `0003` upgrade backfills a
-unique username for every pre-existing account and preserves existing rows.
-Authentication tests cover registration, login, token validation (valid /
-invalid / expired), `/me`, logout and revocation, disabled accounts, the
+unique username for every pre-existing account and preserves existing rows, that
+`0004` upgrades and rolls back cleanly, and that earlier migrations are never
+rewritten. Authentication tests cover registration, login, token validation
+(valid / invalid / expired), `/me`, logout and revocation, disabled accounts, the
 password policy, rate limiting and the guarantee that no raw password ever
 reaches the database. The later suites cover profiles and their protected
 fields, email verification (issue / confirm / expiry / reuse / supersede),
 password change and reset, device sessions and global invalidation, search
 ranking and filtering, one-directional contacts and the cross-feature effects of
-blocks.
+blocks. Chat tests cover conversation creation and idempotency, self/unknown/
+deactivated/blocked targets, per-user listing, ordering and paging, membership
+authorization on every route, message validation and length limits, stable
+chronological history and paging, and the block/unblock transition.
 
 Email is never really sent during tests: the transport is replaced with an
 in-memory capture (`tests/conftest.py`), while token creation, hashing, storage,
@@ -603,6 +691,9 @@ variables or the local `.env` file. See `.env.example` for every supported key:
 | `PASSWORD_RESET_RATE_LIMIT_ATTEMPTS` / `_WINDOW_SECONDS` | `5` / `3600` | Reset-request budget. |
 | `SEARCH_RATE_LIMIT_ATTEMPTS` / `_WINDOW_SECONDS` | `60` / `60` | Search budget per account.      |
 | `CONTACT_RATE_LIMIT_ATTEMPTS` / `_WINDOW_SECONDS` | `30` / `60` | Contact/block write budget.     |
+| `CONVERSATION_MAX_LIMIT` | `50`          | Hard ceiling for one conversation page.        |
+| `MESSAGE_MAX_LIMIT` | `100`             | Hard ceiling for one message page.             |
+| `CHAT_RATE_LIMIT_ATTEMPTS` / `_WINDOW_SECONDS` | `120` / `60` | Chat budget per account. |
 
 Generate a signing key with:
 
@@ -620,9 +711,9 @@ Unexpected failures are normalised to a consistent JSON envelope:
 
 ## Roadmap
 
-Chat/messaging, realtime transport, file storage and E2EE are planned for later
-stages. When the service scales horizontally, move the login rate limiter and
-the token denylist to a shared store (for example Redis).
+Groups, realtime transport, file storage and E2EE are planned for later stages.
+When the service scales horizontally, move the rate limiters and the token
+denylist to a shared store (for example Redis).
 
 ### Known limitations in this phase
 
@@ -642,6 +733,17 @@ the token denylist to a shared store (for example Redis).
   may take slightly longer for an unknown address than a known one (the work
   differs), which is a mild timing signal; it is throttled instead.
 * **Avatars are an opaque key only** — no upload, resize or serving endpoint yet.
+* **Chat is request/response only** — there is no WebSocket or push transport,
+  so clients poll the history endpoint. There are no read receipts, typing
+  indicators, unread counters, edits, deletions or attachments.
+* **Message paging uses `limit`/`offset`.** Ordering is stable (monotonic id),
+  but a page fetched while new messages arrive can shift by those new rows; a
+  cursor (`before_id`) is the natural upgrade if the UI needs it.
+* **A conversation is fixed to two people.** Group chats need a different
+  membership model and are deliberately out of scope for this phase.
+* **Blocked participants can still read their old history.** The block stops new
+  messages in both directions, but it does not retroactively hide messages the
+  other party already received.
 
 ### Deliberately deferred (with design)
 

@@ -84,6 +84,11 @@ DISPLAY_NAME_MAX_LENGTH = 64
 BIO_MAX_LENGTH = 280
 AVATAR_KEY_MAX_LENGTH = 255
 
+# Message bodies are plain text in this phase (no markup, no attachments). The
+# cap keeps a single row bounded and is mirrored by a CHECK constraint on the
+# table, so the limit also holds when application code is bypassed.
+MESSAGE_MAX_LENGTH = 4000
+
 # Usernames are stored lower-cased and restricted to a portable character set.
 # Lower-casing at the boundary makes uniqueness case-insensitive identically on
 # SQLite and PostgreSQL, so a plain unique index is enough. The first character

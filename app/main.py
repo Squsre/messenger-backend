@@ -59,6 +59,13 @@ OPENAPI_TAGS = [
         "name": "blocks",
         "description": "Blocking users; enforced across profiles, search and contacts.",
     },
+    {
+        "name": "chat",
+        "description": (
+            "One-to-one private conversations and messages. No realtime transport "
+            "in this phase: messages are fetched over HTTP."
+        ),
+    },
 ]
 
 
@@ -104,6 +111,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         "contact": SlidingWindowRateLimiter(
             max_requests=settings.contact_rate_limit_attempts,
             window_seconds=settings.contact_rate_limit_window_seconds,
+        ),
+        "chat": SlidingWindowRateLimiter(
+            max_requests=settings.chat_rate_limit_attempts,
+            window_seconds=settings.chat_rate_limit_window_seconds,
         ),
     }
 

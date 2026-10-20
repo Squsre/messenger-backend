@@ -22,9 +22,9 @@ import app.db.models  # noqa: F401
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 #: Revision created by the phase-3 migration; the base point for data-preservation
-#: tests, because it is the last schema that existed before this phase.
+#: tests, because it is the last schema that existed before the profile phase.
 AUTH_REVISION = "0002_create_users_and_token_blocklist"
-HEAD_REVISION = "0003_add_profiles_and_social"
+HEAD_REVISION = "0004_add_conversations"
 
 _USERNAME_PATTERN = re.compile(r"^[a-z0-9_]{3,32}$")
 
@@ -61,6 +61,9 @@ def test_upgrade_head_creates_schema(migration_url: str) -> None:
             "verification_tokens",
             "contacts",
             "blocks",
+            "conversations",
+            "conversation_members",
+            "messages",
             "alembic_version",
         } <= tables
 
@@ -124,6 +127,21 @@ def test_upgrade_head_creates_schema(migration_url: str) -> None:
 
         block_columns = {column["name"] for column in inspector.get_columns("blocks")}
         assert {"id", "blocker_id", "blocked_id", "created_at"} <= block_columns
+
+        conversation_columns = {
+            column["name"] for column in inspector.get_columns("conversations")
+        }
+        assert {"id", "pair_key", "last_message_at", "created_at", "updated_at"} <= (
+            conversation_columns
+        )
+
+        member_columns = {
+            column["name"] for column in inspector.get_columns("conversation_members")
+        }
+        assert {"id", "conversation_id", "user_id", "created_at"} <= member_columns
+
+        message_columns = {column["name"] for column in inspector.get_columns("messages")}
+        assert {"id", "conversation_id", "sender_id", "body", "created_at"} <= message_columns
     finally:
         engine.dispose()
 
@@ -143,15 +161,21 @@ def test_migration_head_is_the_expected_revision(migration_url: str) -> None:
 
 
 def test_migrations_do_not_rewrite_earlier_revisions() -> None:
-    """The phase-3 migration must stay byte-for-byte what it always was.
+    """Applied migrations must never be edited; changes belong in a new revision.
 
-    A migration that was already applied somewhere must never be edited; new
-    columns belong in a new revision. This is a cheap guard against that.
+    This is a cheap guard against rewriting history: each revision's file must
+    still declare its own id and must not refer to the revision that came later.
     """
-    earlier = (PROJECT_ROOT / "migrations" / "versions" /
-               "0002_create_users_and_token_blocklist.py").read_text(encoding="utf-8")
+    versions = PROJECT_ROOT / "migrations" / "versions"
+    earlier = (versions / "0002_create_users_and_token_blocklist.py").read_text(
+        encoding="utf-8"
+    )
     assert 'revision: str = "0002_create_users_and_token_blocklist"' in earlier
     assert "0003" not in earlier
+
+    profiles = (versions / "0003_add_profiles_and_social.py").read_text(encoding="utf-8")
+    assert 'revision: str = "0003_add_profiles_and_social"' in profiles
+    assert "0004" not in profiles
 
 
 def test_email_uniqueness_is_enforced_by_the_database(migration_url: str) -> None:
@@ -353,8 +377,8 @@ def test_upgrade_then_downgrade_to_base(migration_url: str) -> None:
         engine.dispose()
 
 
-def test_downgrade_one_step_removes_only_the_new_tables(migration_url: str) -> None:
-    """Rolling back this phase keeps the phase-3 schema intact."""
+def test_downgrade_one_step_removes_only_the_chat_tables(migration_url: str) -> None:
+    """Rolling back this phase keeps the phase-6 (profile/social) schema intact."""
     config = _alembic_config(migration_url)
     command.upgrade(config, "head")
     command.downgrade(config, "-1")
@@ -363,8 +387,44 @@ def test_downgrade_one_step_removes_only_the_new_tables(migration_url: str) -> N
     try:
         inspector = inspect(engine)
         tables = set(inspector.get_table_names())
+        assert {
+            "health_checks",
+            "users",
+            "token_blocklist",
+            "user_sessions",
+            "verification_tokens",
+            "contacts",
+            "blocks",
+        } <= tables
+        assert not {"conversations", "conversation_members", "messages"} & tables
+
+        # The profile columns from 0003 are untouched.
+        user_columns = {column["name"] for column in inspector.get_columns("users")}
+        assert {"username", "token_version", "profile_visibility"} <= user_columns
+    finally:
+        engine.dispose()
+
+
+def test_downgrade_two_steps_removes_the_profile_schema(migration_url: str) -> None:
+    """0003's downgrade still works now that 0004 sits on top of it."""
+    config = _alembic_config(migration_url)
+    command.upgrade(config, "head")
+    command.downgrade(config, "-2")
+
+    engine = create_db_engine(migration_url)
+    try:
+        inspector = inspect(engine)
+        tables = set(inspector.get_table_names())
         assert {"health_checks", "users", "token_blocklist"} <= tables
-        assert not {"user_sessions", "verification_tokens", "contacts", "blocks"} & tables
+        assert not {
+            "user_sessions",
+            "verification_tokens",
+            "contacts",
+            "blocks",
+            "conversations",
+            "conversation_members",
+            "messages",
+        } & tables
 
         user_columns = {column["name"] for column in inspector.get_columns("users")}
         assert "username" not in user_columns
@@ -383,5 +443,61 @@ def test_migrations_match_models(migration_url: str) -> None:
             migration_context = MigrationContext.configure(connection)
             diff = compare_metadata(migration_context, Base.metadata)
         assert diff == [], f"Schema drift detected: {diff}"
+    finally:
+        engine.dispose()
+
+
+def test_chat_constraints_are_enforced_by_the_database(migration_url: str) -> None:
+    """The chat rules must hold even when application code is bypassed."""
+    command.upgrade(_alembic_config(migration_url), "head")
+
+    engine = create_db_engine(migration_url)
+    try:
+        with engine.begin() as connection:
+            for email, username in (("alice@example.com", "alice"), ("bob@example.com", "bob")):
+                connection.execute(
+                    text(
+                        "INSERT INTO users (email, username, hashed_password, is_active) "
+                        "VALUES (:email, :username, 'not-a-real-hash', 1)"
+                    ),
+                    {"email": email, "username": username},
+                )
+            connection.execute(text("INSERT INTO conversations (pair_key) VALUES ('1:2')"))
+            connection.execute(
+                text("INSERT INTO conversation_members (conversation_id, user_id) VALUES (1, 1)")
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO messages (conversation_id, sender_id, body) "
+                    "VALUES (1, 1, 'hello')"
+                )
+            )
+
+        # One conversation per pair, guaranteed by the unique index.
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(text("INSERT INTO conversations (pair_key) VALUES ('1:2')"))
+
+        # A member cannot be added to the same conversation twice.
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "INSERT INTO conversation_members (conversation_id, user_id) "
+                        "VALUES (1, 1)"
+                    )
+                )
+
+        # Blank and oversized bodies are refused by CHECK constraints.
+        for body in ("   ", "x" * 4001):
+            with pytest.raises(IntegrityError):
+                with engine.begin() as connection:
+                    connection.execute(
+                        text(
+                            "INSERT INTO messages (conversation_id, sender_id, body) "
+                            "VALUES (1, 1, :body)"
+                        ),
+                        {"body": body},
+                    )
     finally:
         engine.dispose()
