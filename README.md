@@ -10,10 +10,13 @@ Backend for the messenger project, built with **Python 3.11**, **FastAPI** and
 > **Stage 3** — production-ready email/password authentication (register, login, `/me`, logout).
 > **Stage 4–6** — user profiles, account security (email verification, password change/reset,
 > device sessions) and contacts/search/blocks.
-> **Stage 7** — one-to-one private conversations and text messages (HTTP only; no realtime
-> transport yet).
+> **Stage 7** — one-to-one private conversations and text messages over HTTP.
+> **Stage 8** — realtime delivery over an authenticated WebSocket (in-process; a
+> shared pub/sub layer is still deferred).
+> **Stage 9** — delivery/read status, unread counters, ephemeral typing
+> indicators and WebSocket-driven last seen.
 >
-> Groups, file uploads, realtime delivery and E2EE are still to come. Two-factor authentication
+> Groups, file uploads and E2EE are still to come. Two-factor authentication
 > and contact *requests* are deliberately deferred and documented in the roadmap.
 
 ## Project layout
@@ -42,7 +45,7 @@ messenger/
 │   │       ├── block.py         # user-to-user blocks
 │   │       ├── conversation.py  # one-to-one conversations (unique pair_key)
 │   │       ├── conversation_member.py # participants
-│   │       └── message.py       # append-only text messages
+│   │       └── message.py       # append-only messages + delivery/read status
 │   ├── services/
 │   │   ├── user.py              # registration, lookup, username derivation
 │   │   ├── profile.py           # profile updates, visibility, last-seen heartbeat
@@ -51,7 +54,9 @@ messenger/
 │   │   ├── verification.py      # issue + consume email/reset tokens
 │   │   ├── email.py             # EmailService: smtp / console / disabled
 │   │   ├── contact.py           # contacts, blocks, user search queries
-│   │   └── chat.py              # conversations, membership, messages
+│   │   ├── auth.py              # shared token -> user resolution (HTTP + WebSocket)
+│   │   ├── realtime.py          # in-process WebSocket connection registry
+│   │   └── chat.py              # conversations, membership, messages, read watermarks
 │   ├── api/
 │   │   ├── deps.py              # token chain, per-scope rate limits, services
 │   │   └── v1/
@@ -63,14 +68,16 @@ messenger/
 │   │           ├── users.py     # /api/v1/users/{me,search,{username}}
 │   │           ├── contacts.py  # /api/v1/contacts
 │   │           ├── blocks.py    # /api/v1/blocks
-│   │           └── conversations.py # /api/v1/conversations
+│   │           ├── conversations.py # /api/v1/conversations
+│   │           └── realtime.py  # WS   /api/v1/ws
 │   └── schemas/
 │       ├── health.py            # response models
 │       ├── auth.py              # auth request/response models
 │       ├── user.py              # public vs private profile models
 │       ├── account.py           # verification, password and session models
 │       ├── contact.py           # username reference model
-│       └── chat.py              # conversation/message request + response models
+│       ├── chat.py              # conversation/message request + response models
+│       └── realtime.py          # WebSocket frame schemas + parser
 ├── migrations/                  # Alembic environment
 │   ├── env.py
 │   ├── script.py.mako
@@ -78,7 +85,9 @@ messenger/
 │       ├── 0001_create_health_checks.py
 │       ├── 0002_create_users_and_token_blocklist.py
 │       ├── 0003_add_profiles_and_social.py
-│       └── 0004_add_conversations_and_messages.py
+│       ├── 0004_add_conversations_and_messages.py
+│       ├── 0005_add_message_client_id.py
+│       └── 0006_add_message_statuses.py
 ├── tests/
 │   ├── conftest.py              # fixtures + register/login and email helpers
 │   ├── test_app.py              # startup, docs, wiring
@@ -96,7 +105,15 @@ messenger/
 │   ├── test_contacts.py         # one-directional contacts
 │   ├── test_blocks.py           # blocks and their cross-feature effects
 │   ├── test_conversations.py    # conversation creation, idempotency, listing, access
-│   └── test_messages.py         # sending, validation, history, paging, blocks
+│   ├── test_messages.py         # sending, validation, history, paging, blocks
+│   ├── test_message_status.py   # delivery/read timestamps, unread counts, last seen
+│   ├── _realtime.py             # WebSocket helpers (not collected as a test)
+│   ├── test_realtime_auth.py    # handshake: tokens, disabled accounts, timeouts
+│   ├── test_realtime_messages.py # send/ack, validation, retries, persistence
+│   ├── test_realtime_access.py  # membership, blocks, conversation isolation
+│   ├── test_realtime_limits.py  # connection cap, rate limit, heartbeat, manager
+│   ├── test_realtime_hardening.py # periodic revalidation, pending caps, retries
+│   └── test_realtime_status.py  # delivered/read events, typing indicators
 ├── alembic.ini
 ├── .env.example
 ├── .gitignore
@@ -145,7 +162,7 @@ SQLite is used by default and lives at `./messenger.db` (configurable through
 The database URL is read from `DATABASE_URL` (via `.env`), so the same commands
 work unchanged after switching to PostgreSQL.
 
-Current head: **`0004_add_conversations`**. Apply it to an existing
+Current head: **`0006_message_statuses`**. Apply it to an existing
 database (created by an earlier stage) with a single `alembic upgrade head`:
 
 | Revision | What it adds |
@@ -154,6 +171,8 @@ database (created by an earlier stage) with a single `alembic upgrade head`:
 | `0002_create_users_and_token_blocklist` | `users`, `token_blocklist` (auth). |
 | `0003_add_profiles_and_social` | Profile/security columns on `users`, plus `user_sessions`, `verification_tokens`, `contacts`, `blocks`. |
 | `0004_add_conversations` | `conversations`, `conversation_members`, `messages` (one-to-one chat). |
+| `0005_message_client_id` | `messages.client_message_id` plus the unique index that makes realtime retries idempotent. |
+| `0006_message_statuses` | `messages.delivered_at` and `messages.read_at` (recipient delivery/read timestamps). |
 
 `0003` is written to be safe on a database that already contains accounts:
 `users.username` is added **nullable**, every existing account is backfilled
@@ -166,11 +185,21 @@ names.
 `0004` only **creates new tables**; it alters nothing that already existed, so it
 is safe on a populated database.
 
-> **Rollback warning:** `alembic downgrade -1` (from `0004`) drops the three chat
-> tables *and the messages they hold*. From `0003` it drops the profile,
-> verification and session columns *and their data*. Both are safe for a
-> throw-away database and are exercised by the test suite, but do not run them on
-> a production database that has real data without a backup.
+`0005` adds a **nullable** column and a unique index. Existing messages keep
+`client_message_id = NULL` (and are therefore unconstrained), no row is
+rewritten, and `downgrade` removes only the key, never the messages.
+
+`0006` adds two **nullable** timestamp columns (`delivered_at`, `read_at`).
+Every existing message starts as "sent, not delivered/read"; no row is rewritten
+and no constraint or index is touched. `downgrade` removes only those two
+columns, never the messages.
+
+> **Rollback warning:** from `0006`, `alembic downgrade -1` only removes the
+> status timestamps; `-2` additionally removes the idempotency key. `-3` drops
+> the three chat tables *and the messages they hold*; `-4` drops the profile,
+> verification and session columns *and their data*. All of these are exercised
+> by the test suite, but do not run them on a production database that has real
+> data without a backup.
 
 
 ### Session usage in future endpoints
@@ -536,6 +565,7 @@ messages in both directions until the block is removed.
 | `GET`  | `/api/v1/conversations`                          | Page through my conversations.                |
 | `GET`  | `/api/v1/conversations/{conversation_id}`        | One conversation I belong to.                 |
 | `POST` | `/api/v1/conversations/{conversation_id}/messages` | Send a message.                            |
+| `POST` | `/api/v1/conversations/{conversation_id}/read` | Mark messages up to an id as read.       |
 | `GET`  | `/api/v1/conversations/{conversation_id}/messages` | Chronological message history (paged).     |
 
 ### Conversations
@@ -558,7 +588,8 @@ is a `404`, and a blocked pair is a `403` — the same vocabulary as contacts.
 most recent activity (`last_message_at`, falling back to `created_at` when no
 message has been sent). Each item carries the **other** participant as a
 `UserPublic` — so last-seen visibility and the absence of email apply exactly as
-in profiles — plus a preview of the newest message.
+in profiles — plus a preview of the newest message and an `unread_count` for the
+caller (messages from the other participant that have not been read).
 
 ### Messages
 
@@ -573,6 +604,36 @@ History is returned **oldest first** and is paged with `limit`/`offset`
 `id`, which is both chronological and stable: timestamps can collide within a
 second, ids cannot. Messages are append-only in this phase — there is no edit or
 delete endpoint.
+
+### Delivery, read status and unread counts
+
+The app is strictly one-to-one, so the recipient-level status can live on the
+message itself:
+
+| Field | Meaning |
+| ----- | ------- |
+| `delivered_at` | The message was pushed to a live socket of the recipient (or the recipient later marked it read). `null` while the recipient was offline. |
+| `read_at` | The recipient explicitly advanced their read watermark past this message. Reading always implies delivery. |
+
+`POST /api/v1/conversations/{conversation_id}/read` with
+`{"last_message_id": 42}` marks every message **from the other participant** with
+an id up to and including 42 as read (and delivered, if needed), then returns:
+
+```json
+{ "conversation_id": 1, "last_read_message_id": 42, "read_at": "…", "updated": 3, "unread_count": 0 }
+```
+
+`updated` is the number of rows that actually changed; a second identical call is
+a safe no-op (`updated: 0`, `read_at: null`). The id must belong to the
+conversation — an id from another conversation, or an unknown id, is `404`, not a
+silent watermark move. The route uses the normal membership check and the chat
+rate limiter. Every accepted read is fanned out as a `read` WebSocket event to
+both participants, so tick marks and unread badges update without polling.
+
+Sending over HTTP also fans the message out to live sockets (not just the
+WebSocket send path); if the recipient has a connection, the response already has
+`delivered_at` set and the sender's other devices receive a `delivered` event.
+Events are only produced after the database commit.
 
 ### Authorization and blocks
 
@@ -590,10 +651,205 @@ conversation exists:
 Chat requests share one per-scope rate limiter (`CHAT_RATE_LIMIT_ATTEMPTS` /
 `CHAT_RATE_LIMIT_WINDOW_SECONDS`), keyed by user id.
 
-The conversation list is built with three queries per page (conversations,
-participants, last messages) instead of one per item, so paging does not turn
-into an N+1. Realtime delivery, read receipts, typing indicators, edits/deletes
-and unread counters are **not** part of this phase; clients poll over HTTP.
+The conversation list is built with four queries per page (conversations,
+participants, last messages, unread counts) instead of one per item, so paging
+does not turn into an N+1. Realtime delivery, delivery/read receipts, typing
+indicators and unread counters are described in the next section; edits/deletes
+and attachments remain out of scope.
+
+## Realtime chat (WebSocket)
+
+The authenticated socket lives at:
+
+```text
+ws://<host>/api/v1/ws        (wss:// behind TLS)
+```
+
+It is intentionally absent from the OpenAPI document (OpenAPI 3.0 cannot
+describe WebSocket frames); this section is the contract.
+
+### Authentication
+
+The access token is **never placed in the URL** (query strings end up in proxy
+and access logs). The socket is accepted first and must then send, as its very
+first frame and within `WS_AUTH_TIMEOUT_SECONDS` (default 5):
+
+```json
+{ "type": "auth", "token": "<access token>" }
+```
+
+The token is resolved by the same four checks the HTTP API uses
+(signature/expiry/issuer/audience, `token_version`, denylist, device session) and
+the account must be active. Until it succeeds, no message is delivered and any
+other frame is refused. Handshake failures close the socket with:
+
+| Condition | Close code | Error code |
+| --------- | ---------- | ---------- |
+| Missing/invalid/expired/revoked token, auth timeout, non-auth first frame | `4401` | `unauthorized` / `auth_timeout` / `auth_required` / `invalid_payload` |
+| Account disabled | `4403` | `forbidden` |
+| Too many open sockets for the account | `4429` | `too_many_connections` |
+| Too many unauthenticated sockets (global or per peer) | `1013` | `server_busy` |
+
+The token is re-validated on every chat message **and** on a fixed interval
+(`WS_TOKEN_RECHECK_INTERVAL_SECONDS`), independently of the frames the client
+sends. Logout, session revocation, `token_version` changes, token expiry and
+account deactivation therefore close an open socket within roughly that interval
+(plus event-loop scheduling). This is a **bounded** invalidation, not an instant
+push from the database: a revoked token may stay usable for up to one recheck
+interval. Do not describe it as instantaneous.
+
+### Frames
+
+Server → client:
+
+```json
+{ "type": "ready", "connection_id": "8f…", "user": { "username": "alice", "display_name": null, "bio": null, "last_seen_at": "…", "created_at": "…", "show_last_seen": true, "profile_visibility": "public", "avatar_key": null }, "conversations": [1, 2], "server_time": "2026-10-20T12:00:00Z" }
+{ "type": "message", "message": { "id": 7, "conversation_id": 1, "sender_username": "alice", "body": "hi", "created_at": "2026-10-20T12:00:00Z", "delivered_at": "2026-10-20T12:00:01Z", "read_at": null } }
+{ "type": "ack", "client_message_id": "retry-1", "duplicate": false, "message": { "id": 7, "conversation_id": 1, "sender_username": "alice", "body": "hi", "created_at": "…", "delivered_at": "…", "read_at": null } }
+{ "type": "delivered", "conversation_id": 1, "message_id": 7, "delivered_at": "2026-10-20T12:00:01Z" }
+{ "type": "read", "conversation_id": 1, "message_id": 7, "reader_username": "bob", "read_at": "2026-10-20T12:03:00Z" }
+{ "type": "typing", "conversation_id": 1, "username": "alice", "is_typing": true, "expires_in_seconds": 5 }
+{ "type": "ping", "server_time": "…" }
+{ "type": "pong", "server_time": "…" }
+{ "type": "error", "code": "invalid_payload", "message": "…", "client_message_id": null, "retry_after_seconds": null }
+```
+
+Client → server:
+
+```json
+{ "type": "auth", "token": "…" }
+{ "type": "message", "conversation_id": 1, "body": "hi", "client_message_id": "retry-1" }
+{ "type": "read", "conversation_id": 1, "last_message_id": 7 }
+{ "type": "typing", "conversation_id": 1, "is_typing": true }
+{ "type": "ping" }
+{ "type": "pong" }
+```
+
+The `delivered` and `read` events carry a **watermark**: every message up to and
+including `message_id` has that status. Clients can apply them with a single
+update instead of tracking per-message rows. The `read` event is sent to both
+participants' connections (the initiating socket can treat it as the
+acknowledgement of its `read` frame), while `delivered` goes only to the sender's
+devices. `typing` is forwarded only to the other participant and is **never
+stored**; `is_typing: false` clears it, and `expires_in_seconds` lets a client
+hide a stale indicator even if the stop frame is lost.
+
+`typing` frames are throttled per connection (`WS_TYPING_MIN_INTERVAL_SECONDS`,
+default 1 s); a stop frame is never throttled. Read frames have their own
+per-connection throttle (`WS_READ_MIN_INTERVAL_SECONDS`, default 0.5 s). Both
+answer an over-eager client with `rate_limited` and `retry_after_seconds` while
+keeping the socket open. Neither is counted against the message budget.
+
+`client_message_id` is optional (1–64 characters). Re-sending the same value in
+the same conversation returns the stored message with `"duplicate": true`
+instead of creating a second row; the unique index on
+`(conversation_id, sender_id, client_message_id)` guarantees this even under a
+race (the losing insert is rolled back inside a savepoint and the stored row is
+returned). Only the first successful send is fanned out, so other devices do not
+see a duplicate.
+
+**Retries versus blocks.** Access rules are evaluated *before* the idempotent
+lookup. If either participant has blocked the other, a retry is answered with
+`forbidden` (`403`) — it does **not** replay the old message as if the send had
+just succeeded. The stored message stays in the history. Reusing a key with a
+*different* body is rejected with `conflict` (`409`); the first accepted body for
+a key is immutable and a retry cannot smuggle new text under an old key.
+
+Frame errors never echo the payload, so a malformed auth frame cannot leak its
+token into a response or a log line.
+
+### Delivery and access
+
+* The sender is always the authenticated account. `sender_id`, `created_at` and
+  other server-owned fields are rejected (`extra="forbid"`), as are non-object
+  JSON, unknown `type` values and binary frames.
+* Sending goes through the same service as `POST …/messages`: trimmed 1–4000
+  character bodies, membership check (non-members get `not_found`, never
+  "forbidden") and the phase-6 block rules (a blocked pair gets `forbidden` and
+  nothing is stored). The block check runs before any idempotent replay, so a
+  blocked retry cannot return a success-shaped `ack`.
+* An event is delivered only to connections whose accounts are members of that
+  conversation, read from the database at send time — there is no "subscribe"
+  frame, so a client cannot widen its audience. The initiating socket gets the
+  `ack`; the other member's devices and the sender's other devices get
+  `message`.
+* The row is committed before the `ack`/fan-out. If the recipient is offline the
+  message simply waits in the history endpoint.
+* **Delivery and read state.** When a message is pushed to a live recipient
+  socket, `delivered_at` is stored in the same transaction and the sender's other
+  devices get a `delivered` event (the sending socket's `ack` already carries the
+  timestamp). `read` frames persist the watermark and are fanned out to both
+  sides; they are also accepted over HTTP. Reading sets `delivered_at` when it was
+  still missing, so a message that arrives while the recipient is offline goes
+  straight from "sent" to "read".
+* **Typing is ephemeral.** A `typing` frame is authorized exactly like a send
+  (membership, then the block rules) and forwarded only to the other
+  participant's live sockets. Nothing is written to the database, and no history
+  or replay contains it. Blocked pairs get `forbidden` and the indicator is not
+  forwarded.
+* **Last seen.** Authenticating refreshes `last_seen_at` (throttled by
+  `LAST_SEEN_UPDATE_INTERVAL_SECONDS`); closing the **last** socket of an account
+  records it immediately. Presence itself is never broadcast, and other accounts
+  only see the timestamp when the owner's `show_last_seen` allows it — the same
+  `UserPublic` rule used by profiles and conversations.
+* Delivery does not rely on the `conversations` list in `ready` (which is a
+  connect-time snapshot): recipients are computed from the database for every
+  message, so a conversation created over HTTP while a socket is open works
+  without reconnecting. Blocking or unblocking likewise takes effect on the next
+  message.
+
+### Limits, heartbeats and cleanup
+
+* Sockets that have not authenticated yet are capped by
+  `WS_MAX_PENDING_CONNECTIONS` (global, default 64) and
+  `WS_MAX_PENDING_CONNECTIONS_PER_IP` (default 8); exceeding either is closed
+  with `1013`/`server_busy`. The slot is released on success, failure, timeout
+  or disconnect, so it cannot leak. The auth frame must arrive within
+  `WS_AUTH_TIMEOUT_SECONDS` (default 5).
+* At most `WS_MAX_CONNECTIONS_PER_USER` (default 5) authenticated sockets per
+  account. The **new** connection is rejected; existing devices are never
+  evicted.
+* Messages are limited per account by `WS_MESSAGE_RATE_LIMIT_ATTEMPTS` /
+  `_WINDOW_SECONDS` (default 60/60s). Exceeding it returns `rate_limited` with
+  `retry_after_seconds` and keeps the socket open; pings are not counted.
+* `typing` and `read` frames have separate per-connection throttles
+  (`WS_TYPING_MIN_INTERVAL_SECONDS`, `WS_READ_MIN_INTERVAL_SECONDS`) so they
+  cannot be turned into a database-write or fan-out loop. A typing `stop` is
+  exempt so the indicator always clears.
+* Raw text frames above `WS_MAX_FRAME_BYTES` (default 64 KiB) are refused before
+  parsing.
+* One background task per connection sends a `ping` every
+  `WS_HEARTBEAT_INTERVAL_SECONDS` and re-validates the token every
+  `WS_TOKEN_RECHECK_INTERVAL_SECONDS`. A client that sends nothing for
+  `WS_IDLE_TIMEOUT_SECONDS` is closed (`1001`) and removed. Clients should answer
+  `ping` with `pong`.
+* The task is cancelled and the connection unregistered on every exit path
+  (client close, network error, idle timeout, shutdown), so disconnects cannot
+  leak tasks, counters or sockets. Closing the last socket of an account also
+  records `last_seen_at`; a failure to write it is logged but never masks the
+  close.
+* A failed send to one socket only removes that socket; it cannot interrupt
+  other users or the sender's other devices. On shutdown every socket is closed
+  with `1001`.
+
+### Multi-process limitation
+
+The connection registry **and the pending counters** are in memory in one
+process. With more than one uvicorn worker (or more than one server) a message
+accepted by worker A is only pushed to sockets held by worker A; clients
+connected elsewhere see it when they refresh history. The same applies to
+`delivered`/`read`/`typing` events (the database state itself is committed, so a
+history/list refresh is correct), and "last socket closed" is only known within
+one worker. The pending caps apply per worker, so the effective global limit
+multiplies with the worker count. Running a single worker is fine for development
+and the current deployment. Scaling out needs a shared pub/sub layer (Redis
+pub/sub or PostgreSQL `LISTEN/NOTIFY`) and shared counters; **Redis is
+deliberately not added in this phase**.
+
+The per-peer pending cap uses `request.client.host`. Behind a reverse proxy that
+is the proxy address unless the proxy is configured to preserve the real client,
+which effectively turns the per-peer cap into a global cap. Configure the proxy
+before relying on it in production.
 
 ## Run the server
 
@@ -631,8 +887,10 @@ migration tests run the real `alembic upgrade`/`downgrade` commands against a
 throw-away database and additionally assert that the migrated schema matches
 the ORM models (no drift); they also verify that the `0003` upgrade backfills a
 unique username for every pre-existing account and preserves existing rows, that
-`0004` upgrades and rolls back cleanly, and that earlier migrations are never
-rewritten. Authentication tests cover registration, login, token validation
+`0004` upgrades and rolls back cleanly, that `0006` only adds nullable status
+columns (existing messages survive both directions), and that earlier migrations
+are never rewritten. Authentication tests cover registration, login, token
+validation
 (valid / invalid / expired), `/me`, logout and revocation, disabled accounts, the
 password policy, rate limiting and the guarantee that no raw password ever
 reaches the database. The later suites cover profiles and their protected
@@ -642,7 +900,22 @@ ranking and filtering, one-directional contacts and the cross-feature effects of
 blocks. Chat tests cover conversation creation and idempotency, self/unknown/
 deactivated/blocked targets, per-user listing, ordering and paging, membership
 authorization on every route, message validation and length limits, stable
-chronological history and paging, and the block/unblock transition.
+chronological history and paging, and the block/unblock transition. Realtime
+tests open real WebSocket sessions and cover valid/invalid/expired/revoked tokens
+and disabled accounts, the auth timeout and frame validation, non-members,
+blocked pairs, conversation isolation, multi-device fan-out, the per-user
+connection cap, the message rate limit, heartbeat/idle cleanup, idempotent
+retries and the guarantee that HTTP history still works afterwards. Hardening
+tests additionally cover periodic revalidation (logout, `token_version`, expiry,
+deactivation) on ping-only sockets, the unauthenticated-socket caps and their
+release on success/failure/timeout/disconnect, block-aware retries, key reuse
+with a different body, and the unique-index race. The phase-9 suites cover
+delivery/read timestamps, HTTP read watermarks and their authorization (non-members,
+foreign/unknown message ids), unread counts, idempotent reads, WS-driven last seen
+including the `show_last_seen` privacy gate, delivered/read fan-out to multiple
+devices, typing routing and expiry fields, block suppression, membership checks
+for typing, per-connection typing/read throttling, and duplicate sends not
+re-emitting status events.
 
 Email is never really sent during tests: the transport is replaced with an
 in-memory capture (`tests/conftest.py`), while token creation, hashing, storage,
@@ -694,6 +967,18 @@ variables or the local `.env` file. See `.env.example` for every supported key:
 | `CONVERSATION_MAX_LIMIT` | `50`          | Hard ceiling for one conversation page.        |
 | `MESSAGE_MAX_LIMIT` | `100`             | Hard ceiling for one message page.             |
 | `CHAT_RATE_LIMIT_ATTEMPTS` / `_WINDOW_SECONDS` | `120` / `60` | Chat budget per account. |
+| `WS_AUTH_TIMEOUT_SECONDS` | `5`        | Seconds allowed for the first `auth` frame.    |
+| `WS_HEARTBEAT_INTERVAL_SECONDS` | `30` | Server `ping` interval.                       |
+| `WS_IDLE_TIMEOUT_SECONDS` | `90`        | Disconnect a client that sends nothing for this long. |
+| `WS_TOKEN_RECHECK_INTERVAL_SECONDS` | `30` | Periodic token/account revalidation (bounded revocation). |
+| `WS_MAX_CONNECTIONS_PER_USER` | `5`     | Authenticated sockets per account (new ones are rejected). |
+| `WS_MAX_PENDING_CONNECTIONS` | `64`     | Unauthenticated sockets allowed in one process. |
+| `WS_MAX_PENDING_CONNECTIONS_PER_IP` | `8` | Unauthenticated sockets per peer address.     |
+| `WS_MAX_FRAME_BYTES` | `65536`          | Raw text-frame ceiling.                        |
+| `WS_MESSAGE_RATE_LIMIT_ATTEMPTS` / `_WINDOW_SECONDS` | `60` / `60` | Realtime message budget per account. |
+| `WS_TYPING_MIN_INTERVAL_SECONDS` | `1`    | Minimum gap between forwarded typing starts.   |
+| `WS_TYPING_EXPIRY_SECONDS` | `5`          | Client-side lifetime of a typing indicator.    |
+| `WS_READ_MIN_INTERVAL_SECONDS` | `0.5`   | Minimum gap between read frames per connection. |
 
 Generate a signing key with:
 
@@ -711,9 +996,10 @@ Unexpected failures are normalised to a consistent JSON envelope:
 
 ## Roadmap
 
-Groups, realtime transport, file storage and E2EE are planned for later stages.
-When the service scales horizontally, move the rate limiters and the token
-denylist to a shared store (for example Redis).
+Groups, file storage and E2EE are planned for later stages, and realtime
+fan-out needs a shared pub/sub store to run in more than one process. When the
+service scales horizontally, move the rate limiters, the token denylist and the
+connection registry to a shared store (for example Redis).
 
 ### Known limitations in this phase
 
@@ -733,9 +1019,31 @@ denylist to a shared store (for example Redis).
   may take slightly longer for an unknown address than a known one (the work
   differs), which is a mild timing signal; it is throttled instead.
 * **Avatars are an opaque key only** — no upload, resize or serving endpoint yet.
-* **Chat is request/response only** — there is no WebSocket or push transport,
-  so clients poll the history endpoint. There are no read receipts, typing
-  indicators, unread counters, edits, deletions or attachments.
+* **Realtime fan-out is single-process.** The WebSocket registry and the
+  unauthenticated-socket counters live in one process; with several workers a
+  client only receives events produced by the worker it is connected to, and the
+  pending caps multiply per worker. A shared pub/sub layer and shared counters
+  are the follow-up (see the realtime section). Rate limits remain per process
+  for the same reason.
+* **WebSocket revocation is bounded, not instantaneous.** An open socket checks
+  its token every `WS_TOKEN_RECHECK_INTERVAL_SECONDS` (default 30 s) and on every
+  chat message. Logout, `token_version`, expiry and deactivation therefore take
+  effect within about one interval; they are not pushed by the database.
+* **The per-peer pending cap depends on the proxy.** It keys on
+  `request.client.host`; behind a proxy that does not preserve the client
+  address, all sockets share the proxy's key.
+* **Delivery/read semantics are simple and one-to-one.** `delivered_at` means
+  "pushed to a live socket of the recipient, or later read"; there is no
+  per-device receipt and no push of missed messages on reconnect (the client
+  fetches history and marks read). "Read" is a watermark the client chooses
+  (`last_message_id`), not a per-message acknowledgement. Typing indicators are
+  in-process and ephemeral. Edits, deletions and attachments are still out of
+  scope.
+* **Last-seen granularity is per process.** It is written on authentication
+  (throttled by `LAST_SEEN_UPDATE_INTERVAL_SECONDS`) and when the last local
+  socket closes; with multiple workers another worker's open socket is invisible,
+  so the timestamp can look slightly early. It is never broadcast, and
+  `show_last_seen=false` hides it from everyone else.
 * **Message paging uses `limit`/`offset`.** Ordering is stable (monotonic id),
   but a page fetched while new messages arrive can shift by those new rows; a
   cursor (`before_id`) is the natural upgrade if the UI needs it.

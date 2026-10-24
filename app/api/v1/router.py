@@ -15,6 +15,7 @@ from app.api.v1.endpoints import (
     contacts,
     conversations,
     health,
+    realtime,
     users,
 )
 
@@ -26,3 +27,4 @@ api_router.include_router(users.router)
 api_router.include_router(contacts.router)
 api_router.include_router(blocks.router)
 api_router.include_router(conversations.router)
+api_router.include_router(realtime.router)

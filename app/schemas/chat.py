@@ -64,13 +64,55 @@ class MessageCreate(BaseModel):
 
 
 class MessageRead(BaseModel):
-    """A stored message."""
+    """A stored message, including the recipient's status timestamps."""
 
     id: int
     conversation_id: int
     sender_username: str = Field(description="Who sent the message.")
     body: str
     created_at: datetime
+    delivered_at: datetime | None = Field(
+        default=None,
+        description=(
+            "When the other participant's device received the message; null "
+            "until it was pushed to a live socket or marked read."
+        ),
+    )
+    read_at: datetime | None = Field(
+        default=None,
+        description=(
+            "When the other participant read the message; null until they "
+            "explicitly marked it read. Reading always implies delivery."
+        ),
+    )
+
+
+class MarkReadRequest(BaseModel):
+    """Advance the read watermark of a conversation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    last_message_id: int = Field(
+        ge=1,
+        description=(
+            "Mark every message from the other participant with an id up to and "
+            "including this one as read."
+        ),
+        examples=[42],
+    )
+
+
+class ReadReceipt(BaseModel):
+    """Outcome of a read-watermark update."""
+
+    conversation_id: int
+    last_read_message_id: int
+    read_at: datetime | None = Field(
+        default=None,
+        description="When the update happened; null when everything was already read.",
+    )
+    updated: int = Field(description="Number of messages that changed.")
+    unread_count: int = Field(description="Unread messages left in the conversation.")
 
 
 class ConversationRead(BaseModel):
@@ -86,6 +128,10 @@ class ConversationRead(BaseModel):
     last_message_at: datetime | None = Field(
         default=None,
         description="Newest activity; null until the first message is sent.",
+    )
+    unread_count: int = Field(
+        default=0,
+        description="Messages from the other participant that the caller has not read.",
     )
 
 
@@ -121,4 +167,6 @@ def build_message(message: Message, *, sender_username: str) -> MessageRead:
         sender_username=sender_username,
         body=message.body,
         created_at=message.created_at,
+        delivered_at=message.delivered_at,
+        read_at=message.read_at,
     )

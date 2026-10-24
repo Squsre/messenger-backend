@@ -24,7 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 #: Revision created by the phase-3 migration; the base point for data-preservation
 #: tests, because it is the last schema that existed before the profile phase.
 AUTH_REVISION = "0002_create_users_and_token_blocklist"
-HEAD_REVISION = "0004_add_conversations"
+HEAD_REVISION = "0006_message_statuses"
 
 _USERNAME_PATTERN = re.compile(r"^[a-z0-9_]{3,32}$")
 
@@ -142,6 +142,8 @@ def test_upgrade_head_creates_schema(migration_url: str) -> None:
 
         message_columns = {column["name"] for column in inspector.get_columns("messages")}
         assert {"id", "conversation_id", "sender_id", "body", "created_at"} <= message_columns
+        assert "client_message_id" in message_columns
+        assert {"delivered_at", "read_at"} <= message_columns
     finally:
         engine.dispose()
 
@@ -176,6 +178,24 @@ def test_migrations_do_not_rewrite_earlier_revisions() -> None:
     profiles = (versions / "0003_add_profiles_and_social.py").read_text(encoding="utf-8")
     assert 'revision: str = "0003_add_profiles_and_social"' in profiles
     assert "0004" not in profiles
+
+    conversations = (versions / "0004_add_conversations_and_messages.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'revision: str = "0004_add_conversations"' in conversations
+    assert "0005" not in conversations
+
+    client_key = (versions / "0005_add_message_client_id.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'revision: str = "0005_message_client_id"' in client_key
+    assert "0006" not in client_key
+
+    statuses = (versions / "0006_add_message_statuses.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'revision: str = "0006_message_statuses"' in statuses
+    assert "0007" not in statuses
 
 
 def test_email_uniqueness_is_enforced_by_the_database(migration_url: str) -> None:
@@ -377,11 +397,51 @@ def test_upgrade_then_downgrade_to_base(migration_url: str) -> None:
         engine.dispose()
 
 
-def test_downgrade_one_step_removes_only_the_chat_tables(migration_url: str) -> None:
-    """Rolling back this phase keeps the phase-6 (profile/social) schema intact."""
+def test_downgrade_one_step_removes_the_status_columns(migration_url: str) -> None:
+    """Rolling back only 0006 keeps every message and the idempotency key."""
     config = _alembic_config(migration_url)
     command.upgrade(config, "head")
     command.downgrade(config, "-1")
+
+    engine = create_db_engine(migration_url)
+    try:
+        inspector = inspect(engine)
+        tables = set(inspector.get_table_names())
+        assert {"conversations", "conversation_members", "messages"} <= tables
+
+        message_columns = {column["name"] for column in inspector.get_columns("messages")}
+        assert "delivered_at" not in message_columns
+        assert "read_at" not in message_columns
+        assert "client_message_id" in message_columns
+    finally:
+        engine.dispose()
+
+
+def test_downgrade_two_steps_removes_the_idempotency_key(migration_url: str) -> None:
+    """Rolling back 0006 and 0005 still keeps every chat table and row."""
+    config = _alembic_config(migration_url)
+    command.upgrade(config, "head")
+    command.downgrade(config, "-2")
+
+    engine = create_db_engine(migration_url)
+    try:
+        inspector = inspect(engine)
+        tables = set(inspector.get_table_names())
+        assert {"conversations", "conversation_members", "messages"} <= tables
+
+        message_columns = {column["name"] for column in inspector.get_columns("messages")}
+        assert "client_message_id" not in message_columns
+        assert "delivered_at" not in message_columns
+        assert "read_at" not in message_columns
+    finally:
+        engine.dispose()
+
+
+def test_downgrade_three_steps_removes_only_the_chat_tables(migration_url: str) -> None:
+    """Rolling back 0006, 0005 and 0004 keeps the phase-6 profile schema."""
+    config = _alembic_config(migration_url)
+    command.upgrade(config, "head")
+    command.downgrade(config, "-3")
 
     engine = create_db_engine(migration_url)
     try:
@@ -405,11 +465,11 @@ def test_downgrade_one_step_removes_only_the_chat_tables(migration_url: str) -> 
         engine.dispose()
 
 
-def test_downgrade_two_steps_removes_the_profile_schema(migration_url: str) -> None:
-    """0003's downgrade still works now that 0004 sits on top of it."""
+def test_downgrade_four_steps_removes_the_profile_schema(migration_url: str) -> None:
+    """0003's downgrade still works now that 0004-0006 sit on top of it."""
     config = _alembic_config(migration_url)
     command.upgrade(config, "head")
-    command.downgrade(config, "-2")
+    command.downgrade(config, "-4")
 
     engine = create_db_engine(migration_url)
     try:
@@ -429,6 +489,70 @@ def test_downgrade_two_steps_removes_the_profile_schema(migration_url: str) -> N
         user_columns = {column["name"] for column in inspector.get_columns("users")}
         assert "username" not in user_columns
         assert "token_version" not in user_columns
+    finally:
+        engine.dispose()
+
+
+def test_status_migration_preserves_existing_messages(migration_url: str) -> None:
+    """0006 must only add nullable columns; existing chat rows survive."""
+    config = _alembic_config(migration_url)
+    command.upgrade(config, "0005_message_client_id")
+
+    engine = create_db_engine(migration_url)
+    try:
+        with engine.begin() as connection:
+            for email, username in (
+                ("alice@example.com", "alice"),
+                ("bob@example.com", "bob"),
+            ):
+                connection.execute(
+                    text(
+                        "INSERT INTO users (email, username, hashed_password, is_active) "
+                        "VALUES (:email, :username, 'not-a-real-hash', 1)"
+                    ),
+                    {"email": email, "username": username},
+                )
+            connection.execute(text("INSERT INTO conversations (pair_key) VALUES ('1:2')"))
+            connection.execute(
+                text(
+                    "INSERT INTO messages "
+                    "(conversation_id, sender_id, body, client_message_id) "
+                    "VALUES (1, 1, 'before-statuses', 'legacy-key')"
+                )
+            )
+    finally:
+        engine.dispose()
+
+    command.upgrade(config, "head")
+
+    engine = create_db_engine(migration_url)
+    try:
+        with engine.connect() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT id, body, client_message_id, delivered_at, read_at "
+                    "FROM messages"
+                )
+            ).one()
+        assert row.id == 1
+        assert row.body == "before-statuses"
+        assert row.client_message_id == "legacy-key"
+        assert row.delivered_at is None
+        assert row.read_at is None
+    finally:
+        engine.dispose()
+
+    command.downgrade(config, "-1")
+
+    engine = create_db_engine(migration_url)
+    try:
+        with engine.connect() as connection:
+            row = connection.execute(
+                text("SELECT id, body, client_message_id FROM messages")
+            ).one()
+        assert row.id == 1
+        assert row.body == "before-statuses"
+        assert row.client_message_id == "legacy-key"
     finally:
         engine.dispose()
 
@@ -485,6 +609,35 @@ def test_chat_constraints_are_enforced_by_the_database(migration_url: str) -> No
                     text(
                         "INSERT INTO conversation_members (conversation_id, user_id) "
                         "VALUES (1, 1)"
+                    )
+                )
+
+        # A client retry cannot duplicate a message that sends the same key.
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO messages "
+                    "(conversation_id, sender_id, body, client_message_id) "
+                    "VALUES (1, 1, 'retry', 'key-1')"
+                )
+            )
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "INSERT INTO messages "
+                        "(conversation_id, sender_id, body, client_message_id) "
+                        "VALUES (1, 1, 'retry', 'key-1')"
+                    )
+                )
+
+        # Rows without a key are never constrained (NULLs are distinct).
+        with engine.begin() as connection:
+            for _ in range(2):
+                connection.execute(
+                    text(
+                        "INSERT INTO messages (conversation_id, sender_id, body) "
+                        "VALUES (1, 1, 'plain')"
                     )
                 )
 

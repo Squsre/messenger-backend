@@ -25,6 +25,7 @@ from app.core.rate_limit import SlidingWindowRateLimiter
 from app.db.session import Database
 from app.schemas.health import RootResponse
 from app.services.email import build_email_service
+from app.services.realtime import ConnectionManager
 
 logger = logging.getLogger(__name__)
 
@@ -62,8 +63,9 @@ OPENAPI_TAGS = [
     {
         "name": "chat",
         "description": (
-            "One-to-one private conversations and messages. No realtime transport "
-            "in this phase: messages are fetched over HTTP."
+            "One-to-one private conversations and messages, including delivery "
+            "and read status, unread counts and read markers. Realtime delivery "
+            "and ephemeral typing indicators use the WebSocket at /api/v1/ws."
         ),
     },
 ]
@@ -116,7 +118,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             max_requests=settings.chat_rate_limit_attempts,
             window_seconds=settings.chat_rate_limit_window_seconds,
         ),
+        "ws": SlidingWindowRateLimiter(
+            max_requests=settings.ws_message_rate_limit_attempts,
+            window_seconds=settings.ws_message_rate_limit_window_seconds,
+        ),
     }
+
+    # Live WebSocket sockets. In-process only; see app/services/realtime.py and
+    # the README for the multi-worker limitation.
+    ws_manager = ConnectionManager(
+        max_per_user=settings.ws_max_connections_per_user,
+        max_pending_connections=settings.ws_max_pending_connections,
+        max_pending_per_key=settings.ws_max_pending_connections_per_ip,
+    )
 
     email_service = build_email_service(settings)
 
@@ -126,13 +140,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             yield
         finally:
+            # Tell every connected client the server is going away before the
+            # database engine is disposed.
+            await ws_manager.close_all(code=1001, reason="Server is shutting down")
             database.dispose()
             logger.info("Database engine disposed")
 
     app = FastAPI(
         title=settings.app_name,
         version=settings.app_version or __version__,
-        description="Backend for the messenger project.",
+        description=(
+            "Backend for the messenger project.\n\n"
+            "Realtime chat is available over WebSocket at `/api/v1/ws`. Because "
+            "OpenAPI 3.0 cannot describe WebSocket frames, that protocol is "
+            "documented in the README (see \"Realtime chat (WebSocket)\")."
+        ),
         docs_url="/docs",
         redoc_url="/redoc",
         openapi_url="/openapi.json",
@@ -147,6 +169,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.login_rate_limiter = login_rate_limiter
     app.state.rate_limiters = rate_limiters
     app.state.email_service = email_service
+    app.state.ws_manager = ws_manager
 
     if settings.cors_origins:
         # ``allow_credentials`` stays off: authentication uses Bearer tokens,

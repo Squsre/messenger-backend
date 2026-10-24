@@ -6,6 +6,7 @@ Routes (all under ``/api/v1/conversations``):
 * ``GET    /``                            — page through my conversations
 * ``GET    /{conversation_id}``           — one conversation I belong to
 * ``POST   /{conversation_id}/messages``  — send a message
+* ``POST   /{conversation_id}/read``      — mark messages as read
 * ``GET    /{conversation_id}/messages``  — chronological history
 
 Authorization is uniform: every route resolves the conversation through
@@ -36,11 +37,14 @@ from app.schemas.chat import (
     ConversationDetail,
     ConversationPage,
     ConversationRead,
+    MarkReadRequest,
     MessageCreate,
     MessagePage,
     MessageRead,
+    ReadReceipt,
     build_message,
 )
+from app.schemas.realtime import DeliveredEvent, MessageEvent, ReadEvent
 from app.schemas.user import build_public_profile
 from app.services import chat as chat_service
 from app.services.profile import visible_last_seen
@@ -149,6 +153,7 @@ def _conversation_summary(
     viewer: User,
     participant: User,
     last: Message | None,
+    unread_count: int = 0,
 ) -> ConversationRead:
     """Assemble a conversation for output.
 
@@ -172,6 +177,7 @@ def _conversation_summary(
         last_message=last_message,
         created_at=conversation.created_at,
         last_message_at=conversation.last_message_at,
+        unread_count=unread_count,
     )
 
 
@@ -187,6 +193,9 @@ def _conversation_detail(
         viewer=viewer,
         participant=participant,
         last=chat_service.last_message(db, conversation_id=conversation.id),
+        unread_count=chat_service.unread_count(
+            db, conversation_id=conversation.id, viewer_id=viewer.id
+        ),
     )
     return ConversationDetail(
         **summary.model_dump(),
@@ -283,6 +292,9 @@ def list_my_conversations(
         viewer_id=current_user.id,
     )
     latest = chat_service.latest_messages(db, conversation_ids=conversation_ids)
+    unread = chat_service.unread_counts(
+        db, user_id=current_user.id, conversation_ids=conversation_ids
+    )
 
     items = []
     for conversation in conversations:
@@ -295,6 +307,7 @@ def list_my_conversations(
                 viewer=current_user,
                 participant=participant,
                 last=latest.get(conversation.id),
+                unread_count=unread.get(conversation.id, 0),
             )
         )
 
@@ -341,7 +354,11 @@ def get_conversation(
         "Append a text message to a conversation I participate in. The body is "
         "trimmed and must be 1-4000 characters; an empty or whitespace-only body "
         "is rejected. Sending is refused when either participant has blocked the "
-        "other, even if the conversation already existed."
+        "other, even if the conversation already existed.\n\n"
+        "The message is pushed to the other participant's live WebSocket "
+        "connections (and to the sender's other devices). If the recipient has a "
+        "live connection, the response's ``delivered_at`` is set; otherwise it "
+        "stays null until they read the message."
     ),
     responses={
         400: _BAD_REQUEST_RESPONSE,
@@ -352,7 +369,7 @@ def get_conversation(
         429: _RATE_LIMIT_RESPONSE,
     },
 )
-def send_message(
+async def send_message(
     conversation_id: int,
     payload: MessageCreate,
     request: Request,
@@ -360,19 +377,124 @@ def send_message(
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
 ) -> MessageRead:
-    """Store a message from the caller in the given conversation."""
+    """Store a message from the caller and fan it out to live sockets."""
     deps.enforce_rate_limit(request, settings, "chat", f"user:{current_user.id}")
 
     conversation = chat_service.require_membership(
         db, conversation_id=conversation_id, user_id=current_user.id
     )
-    message = chat_service.send_message(
+    message, created = chat_service.send_message(
         db,
         conversation=conversation,
         sender=current_user,
         body=payload.body,
     )
-    return build_message(message, sender_username=current_user.username)
+
+    manager = getattr(request.app.state, "ws_manager", None)
+    delivered_at = None
+    member_ids: list[int] = []
+    if created:
+        member_ids = chat_service.conversation_member_ids(
+            db, conversation_id=conversation.id
+        )
+        recipient = chat_service.other_participant(
+            db, conversation_id=conversation.id, viewer_id=current_user.id
+        )
+        if manager is not None and manager.connection_count(recipient.id):
+            # The recipient has a live socket in this process; the message is
+            # about to be pushed, so it counts as delivered.
+            message.delivered_at = chat_service.utcnow()
+            db.flush()
+            delivered_at = message.delivered_at
+
+    rendered = build_message(message, sender_username=current_user.username)
+
+    if created and manager is not None:
+        # Make the status durable before telling anyone about it.
+        db.commit()
+        await manager.broadcast(
+            user_ids=member_ids,
+            payload=MessageEvent(message=rendered).model_dump(mode="json"),
+        )
+        if delivered_at is not None:
+            await manager.broadcast(
+                user_ids=[current_user.id],
+                payload=DeliveredEvent(
+                    conversation_id=conversation.id,
+                    message_id=message.id,
+                    delivered_at=delivered_at,
+                ).model_dump(mode="json"),
+            )
+
+    return rendered
+
+
+@router.post(
+    "/{conversation_id}/read",
+    response_model=ReadReceipt,
+    summary="Mark messages as read",
+    description=(
+        "Advance my read watermark in a conversation. Every message from the "
+        "other participant up to and including ``last_message_id`` is marked "
+        "read (and delivered, if it was not already). ``last_message_id`` must "
+        "belong to this conversation; anything else is ``404``.\n\n"
+        "The other participant's live connections receive a ``read`` WebSocket "
+        "event, so their UI can update the tick marks without polling."
+    ),
+    responses={
+        401: _UNAUTHORIZED_RESPONSE,
+        403: _DISABLED_RESPONSE,
+        404: _NOT_FOUND_RESPONSE,
+        422: _VALIDATION_RESPONSE,
+        429: _RATE_LIMIT_RESPONSE,
+    },
+)
+async def mark_conversation_read(
+    conversation_id: int,
+    payload: MarkReadRequest,
+    request: Request,
+    current_user: User = Depends(deps.get_current_active_user),
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_app_settings),
+) -> ReadReceipt:
+    """Mark incoming messages up to ``last_message_id`` as read."""
+    deps.enforce_rate_limit(request, settings, "chat", f"user:{current_user.id}")
+
+    conversation = chat_service.require_membership(
+        db, conversation_id=conversation_id, user_id=current_user.id
+    )
+    state = chat_service.mark_read(
+        db,
+        conversation_id=conversation.id,
+        reader_id=current_user.id,
+        last_message_id=payload.last_message_id,
+    )
+
+    manager = getattr(request.app.state, "ws_manager", None)
+    if state.updated and state.read_at is not None and manager is not None:
+        member_ids = chat_service.conversation_member_ids(
+            db, conversation_id=conversation.id
+        )
+        # Commit before broadcasting so a recipient can never observe a stale
+        # (still-unread) message after receiving the event.
+        db.commit()
+        await manager.broadcast(
+            user_ids=member_ids,
+            payload=ReadEvent(
+                conversation_id=conversation.id,
+                message_id=state.last_read_message_id,
+                reader_username=current_user.username,
+                read_at=state.read_at,
+            ).model_dump(mode="json"),
+        )
+
+    return ReadReceipt(
+        conversation_id=conversation.id,
+        last_read_message_id=state.last_read_message_id,
+        read_at=state.read_at,
+        updated=state.updated,
+        unread_count=state.unread_count,
+    )
 
 
 @router.get(

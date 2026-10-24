@@ -124,6 +124,8 @@ def test_message_response_has_no_numeric_user_ids(client, api) -> None:
         "sender_username",
         "body",
         "created_at",
+        "delivered_at",
+        "read_at",
     }
 
 

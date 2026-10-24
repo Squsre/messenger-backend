@@ -89,6 +89,10 @@ AVATAR_KEY_MAX_LENGTH = 255
 # table, so the limit also holds when application code is bypassed.
 MESSAGE_MAX_LENGTH = 4000
 
+# Optional idempotency key sent by realtime clients. Bounded so it cannot be
+# used as an unbounded side channel; stored only in ``messages``.
+CLIENT_MESSAGE_ID_MAX_LENGTH = 64
+
 # Usernames are stored lower-cased and restricted to a portable character set.
 # Lower-casing at the boundary makes uniqueness case-insensitive identically on
 # SQLite and PostgreSQL, so a plain unique index is enough. The first character

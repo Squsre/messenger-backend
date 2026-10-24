@@ -18,14 +18,20 @@ every entry point:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.errors import BadRequestError, ForbiddenError, NotFoundError
-from app.core.security import MESSAGE_MAX_LENGTH
+from app.core.errors import (
+    BadRequestError,
+    ConflictError,
+    ForbiddenError,
+    NotFoundError,
+)
+from app.core.security import CLIENT_MESSAGE_ID_MAX_LENGTH, MESSAGE_MAX_LENGTH
 from app.db.models import Conversation, ConversationMember, Message, User
 from app.services.contact import is_blocked_between
 
@@ -203,6 +209,29 @@ def other_participants(
     return {conversation_id: user for conversation_id, user in db.execute(statement).all()}
 
 
+def conversation_member_ids(db: Session, *, conversation_id: int) -> list[int]:
+    """User ids of every participant in a conversation.
+
+    Used by the realtime layer to decide which live connections may receive an
+    event. The answer always comes from the database, so a connection cannot
+    widen its own audience.
+    """
+    statement = select(ConversationMember.user_id).where(
+        ConversationMember.conversation_id == conversation_id
+    )
+    return list(db.execute(statement).scalars().all())
+
+
+def conversation_ids_for(db: Session, *, user_id: int) -> list[int]:
+    """Conversation ids the user participates in (for the ``ready`` event)."""
+    statement = (
+        select(ConversationMember.conversation_id)
+        .where(ConversationMember.user_id == user_id)
+        .order_by(ConversationMember.conversation_id.asc())
+    )
+    return list(db.execute(statement).scalars().all())
+
+
 # --- messages ---------------------------------------------------------------
 
 
@@ -236,13 +265,24 @@ def send_message(
     conversation: Conversation,
     sender: User,
     body: str,
-) -> Message:
+    client_message_id: str | None = None,
+) -> tuple[Message, bool]:
     """Append a message to a conversation.
 
+    Returns ``(message, created)``. ``created`` is ``False`` when the same
+    sender already sent this ``client_message_id`` in this conversation — a
+    realtime client retrying after a dropped connection gets the stored row back
+    instead of a duplicate.
+
+    Access rules are checked **before** the idempotent lookup: after either side
+    blocks the other, a retry is rejected with ``403`` and never returns the
+    old message as if the send had just succeeded. Reusing a key with a
+    different body is ``409`` (see :func:`_replay`).
+
     The caller must already have been authorized with :func:`require_membership`.
-    Blocking is re-checked here because it can happen after the conversation was
-    created: a blocked pair may keep reading its history but cannot exchange new
-    messages.
+    Blocking is re-checked here because it can happen *after* the conversation
+    was created: a blocked pair may keep reading its history but cannot exchange
+    new messages.
     """
     text = body.strip()
     if not text:
@@ -252,24 +292,189 @@ def send_message(
             f"Message body must be at most {MESSAGE_MAX_LENGTH} characters."
         )
 
+    key = client_message_id.strip() if client_message_id else None
+    if not key:
+        key = None
+    if key is not None and len(key) > CLIENT_MESSAGE_ID_MAX_LENGTH:
+        raise BadRequestError(
+            "client_message_id must be at most "
+            f"{CLIENT_MESSAGE_ID_MAX_LENGTH} characters."
+        )
+
+    # Block rules are evaluated *before* an idempotent replay. A blocked pair
+    # must never receive a success-shaped response for a retry: the old message
+    # stays in history, but the socket cannot use retries to keep a send path
+    # open after the block.
     recipient = other_participant(
         db, conversation_id=conversation.id, viewer_id=sender.id
     )
     if is_blocked_between(db, sender.id, recipient.id):
         raise ForbiddenError("This user is not available.")
 
+    if key is not None:
+        existing = db.execute(
+            _message_by_client_id(conversation.id, sender.id, key)
+        ).scalar_one_or_none()
+        if existing is not None:
+            return _replay(existing, text), False
+
     message = Message(
         conversation_id=conversation.id,
         sender_id=sender.id,
         body=text,
+        client_message_id=key,
         # Set explicitly (the column also has a server default for raw inserts)
         # so the response and `last_message_at` agree without an extra SELECT.
         created_at=utcnow(),
     )
-    db.add(message)
+    try:
+        # The row is added *inside* the savepoint so a concurrent retry with the
+        # same key can roll back just this insert and reuse the stored message.
+        with db.begin_nested():
+            db.add(message)
+            db.flush()
+    except IntegrityError:
+        if key is None:  # pragma: no cover - only the unique index can conflict
+            raise
+        existing = db.execute(
+            _message_by_client_id(conversation.id, sender.id, key)
+        ).scalar_one()
+        return _replay(existing, text), False
+
     conversation.last_message_at = message.created_at
     db.flush()
-    return message
+    return message, True
+
+
+def _replay(existing: Message, body: str) -> Message:
+    """Validate an idempotent retry and return the stored message.
+
+    The first successful body for a ``client_message_id`` is immutable: a retry
+    with *different* text is a client bug or an attempt to smuggle new content
+    under an old key, so it is refused with ``409`` instead of being ignored.
+    """
+    if existing.body != body:
+        raise ConflictError(
+            "client_message_id was already used with a different message body."
+        )
+    return existing
+
+
+def _message_by_client_id(
+    conversation_id: int, sender_id: int, client_message_id: str
+) -> Select[tuple[Message]]:
+    return select(Message).where(
+        Message.conversation_id == conversation_id,
+        Message.sender_id == sender_id,
+        Message.client_message_id == client_message_id,
+    )
+
+
+# --- delivery and read state ------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ReadState:
+    """Result of marking a conversation read up to a message id."""
+
+    last_read_message_id: int
+    #: ``None`` when nothing new needed updating.
+    read_at: datetime | None
+    #: Messages that actually changed (0 when everything was already read).
+    updated: int
+    unread_count: int
+
+
+def mark_read(
+    db: Session,
+    *,
+    conversation_id: int,
+    reader_id: int,
+    last_message_id: int,
+) -> ReadState:
+    """Mark every message up to ``last_message_id`` as read for ``reader_id``.
+
+    Only messages *from the other participant* are considered: a user's own
+    messages are never "unread" for them. Reading implies delivery, so
+    ``delivered_at`` is filled in when it was still ``NULL``.
+
+    The target id must exist **in this conversation**. A caller cannot use an id
+    from another conversation (or one that does not exist) to move the watermark:
+    that is a ``404``, consistent with the rest of the chat API.
+    """
+    target = db.execute(
+        select(Message.id).where(
+            Message.id == last_message_id,
+            Message.conversation_id == conversation_id,
+        )
+    ).scalar_one_or_none()
+    if target is None:
+        raise NotFoundError("Message not found.")
+
+    now = utcnow()
+    result = db.execute(
+        update(Message)
+        .where(
+            Message.conversation_id == conversation_id,
+            Message.sender_id != reader_id,
+            Message.id <= last_message_id,
+            Message.read_at.is_(None),
+        )
+        .values(
+            read_at=now,
+            delivered_at=func.coalesce(Message.delivered_at, now),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    db.flush()
+    updated = int(result.rowcount or 0)
+    return ReadState(
+        last_read_message_id=last_message_id,
+        read_at=now if updated else None,
+        updated=updated,
+        unread_count=unread_count(
+            db, conversation_id=conversation_id, viewer_id=reader_id
+        ),
+    )
+
+
+def unread_count(db: Session, *, conversation_id: int, viewer_id: int) -> int:
+    """Unread messages from the other participant in one conversation."""
+    return unread_counts(
+        db, user_id=viewer_id, conversation_ids=[conversation_id]
+    ).get(conversation_id, 0)
+
+
+def unread_counts(
+    db: Session, *, user_id: int, conversation_ids: list[int]
+) -> dict[int, int]:
+    """Unread counts for several conversations, keyed by conversation id.
+
+    Joining :class:`ConversationMember` is not just an optimisation: it makes
+    the database itself refuse to count conversations the caller does not belong
+    to, even if a caller passes an id it should not know.
+    """
+    if not conversation_ids:
+        return {}
+
+    statement = (
+        select(Message.conversation_id, func.count())
+        .join(
+            ConversationMember,
+            ConversationMember.conversation_id == Message.conversation_id,
+        )
+        .where(
+            Message.conversation_id.in_(conversation_ids),
+            ConversationMember.user_id == user_id,
+            Message.sender_id != user_id,
+            Message.read_at.is_(None),
+        )
+        .group_by(Message.conversation_id)
+    )
+    return {
+        conversation_id: int(total)
+        for conversation_id, total in db.execute(statement).all()
+    }
 
 
 def list_messages(

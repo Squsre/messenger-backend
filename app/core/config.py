@@ -162,6 +162,38 @@ class Settings(DatabaseSettings):
     conversation_max_limit: int = Field(default=50, ge=1, le=100)
     message_max_limit: int = Field(default=100, ge=1, le=200)
 
+    # --- Realtime (WebSocket) ---
+    # Seconds a freshly accepted socket may wait for its auth frame. Kept short
+    # on purpose: an unauthenticated socket only consumes a pending slot.
+    ws_auth_timeout_seconds: float = Field(default=5.0, gt=0, le=120)
+    # How often the server sends an application-level ``ping``.
+    ws_heartbeat_interval_seconds: float = Field(default=30.0, ge=0.01, le=3600)
+    # A client that sends nothing for this long is disconnected and cleaned up.
+    ws_idle_timeout_seconds: float = Field(default=90.0, gt=0, le=7200)
+    # How often an open socket re-validates its token and account state,
+    # independently of the frames it sends. Revocation is therefore bounded by
+    # this interval (plus scheduling), not instantaneous. The lower bound keeps
+    # a misconfiguration from turning the heartbeat into a database query loop.
+    ws_token_recheck_interval_seconds: float = Field(default=30.0, ge=0.01, le=3600)
+    # Devices/tabs a single account may keep open at once. The cap rejects the
+    # new connection; it never evicts a working one.
+    ws_max_connections_per_user: int = Field(default=5, ge=1, le=100)
+    # Pre-authentication sockets: a global ceiling and a per-peer ceiling.
+    ws_max_pending_connections: int = Field(default=64, ge=1, le=10000)
+    ws_max_pending_connections_per_ip: int = Field(default=8, ge=1, le=1000)
+    # Raw text-frame ceiling. Larger frames are rejected before JSON parsing;
+    # the real body limit (MESSAGE_MAX_LENGTH) is applied afterwards.
+    ws_max_frame_bytes: int = Field(default=65536, ge=1024, le=1048576)
+    # Per-account message budget over the socket (pings are not counted).
+    ws_message_rate_limit_attempts: int = Field(default=60, ge=1)
+    ws_message_rate_limit_window_seconds: int = Field(default=60, ge=1)
+    # Typing and read-receipt frames are throttled *per connection* so a buggy
+    # client cannot turn them into a database write loop. ``is_typing=false`` is
+    # never throttled, so a stop is always delivered.
+    ws_typing_min_interval_seconds: float = Field(default=1.0, gt=0, le=60)
+    ws_typing_expiry_seconds: int = Field(default=5, ge=1, le=60)
+    ws_read_min_interval_seconds: float = Field(default=0.5, gt=0, le=60)
+
     # --- Email delivery ---
     # ``console`` writes messages to EMAIL_OUTBOX_DIR (development only),
     # ``smtp`` sends over the network, ``disabled`` drops them.
