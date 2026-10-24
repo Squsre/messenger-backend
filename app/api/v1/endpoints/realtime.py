@@ -27,10 +27,11 @@ therefore can neither read nor write another conversation.
 Persistence
 -----------
 Messages go through :func:`app.services.chat.send_message`, the same function the
-HTTP endpoint uses, so validation, block rules, timestamps and the
-``last_message_at`` update are shared. A message is committed to the database
+HTTP endpoint uses, so validation, block rules, media ownership, timestamps and
+the ``last_message_at`` update are shared. A message is committed to the database
 *before* it is acknowledged or fanned out; if the recipient is offline it simply
-stays in the history.
+stays in the history. Media is uploaded over HTTP first; the socket only receives
+its opaque id, never bytes.
 
 Statuses and activity
 ---------------------
@@ -105,6 +106,7 @@ from app.schemas.realtime import (
 )
 from app.schemas.user import build_public_profile
 from app.services import chat as chat_service
+from app.services import media as media_service
 from app.services.auth import resolve_access_token
 from app.services.contact import is_blocked_between
 from app.services.profile import touch_last_seen, visible_last_seen
@@ -364,12 +366,21 @@ async def _dispatch(
             conversation = chat_service.require_membership(
                 db, conversation_id=frame.conversation_id, user_id=user.id
             )
+            media = None
+            if frame.media_id is not None:
+                media = media_service.require_owned_media(
+                    db,
+                    public_id=frame.media_id,
+                    conversation_id=conversation.id,
+                    uploader_id=user.id,
+                )
             message, created = chat_service.send_message(
                 db,
                 conversation=conversation,
                 sender=user,
                 body=frame.body,
                 client_message_id=frame.client_message_id,
+                media=media,
             )
             member_ids = chat_service.conversation_member_ids(
                 db, conversation_id=conversation.id
@@ -383,7 +394,9 @@ async def _dispatch(
                     message.delivered_at = chat_service.utcnow()
                     db.flush()
                     delivered_at = message.delivered_at
-            rendered = build_message(message, sender_username=user.username)
+            rendered = build_message(
+                message, sender_username=user.username, media=media
+            )
     except UnauthorizedError as exc:
         await _send_error(
             manager,

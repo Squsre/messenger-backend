@@ -30,7 +30,7 @@ from app.api import deps
 from app.core.config import Settings
 from app.core.dependencies import get_app_settings
 from app.core.errors import NotFoundError
-from app.db.models import Conversation, Message, User
+from app.db.models import Conversation, Media, Message, User
 from app.db.session import get_db
 from app.schemas.chat import (
     ConversationCreate,
@@ -47,6 +47,7 @@ from app.schemas.chat import (
 from app.schemas.realtime import DeliveredEvent, MessageEvent, ReadEvent
 from app.schemas.user import build_public_profile
 from app.services import chat as chat_service
+from app.services import media as media_service
 from app.services.profile import visible_last_seen
 from app.services.user import get_user_by_username
 
@@ -154,6 +155,7 @@ def _conversation_summary(
     participant: User,
     last: Message | None,
     unread_count: int = 0,
+    media: Media | None = None,
 ) -> ConversationRead:
     """Assemble a conversation for output.
 
@@ -166,7 +168,9 @@ def _conversation_summary(
         sender_username = (
             viewer.username if last.sender_id == viewer.id else participant.username
         )
-        last_message = build_message(last, sender_username=sender_username)
+        last_message = build_message(
+            last, sender_username=sender_username, media=media
+        )
 
     return ConversationRead(
         id=conversation.id,
@@ -188,13 +192,19 @@ def _conversation_detail(
     viewer: User,
     participant: User,
 ) -> ConversationDetail:
+    last = chat_service.last_message(db, conversation_id=conversation.id)
     summary = _conversation_summary(
         conversation,
         viewer=viewer,
         participant=participant,
-        last=chat_service.last_message(db, conversation_id=conversation.id),
+        last=last,
         unread_count=chat_service.unread_count(
             db, conversation_id=conversation.id, viewer_id=viewer.id
+        ),
+        media=(
+            media_service.media_for_message(db, message_id=last.id)
+            if last is not None
+            else None
         ),
     )
     return ConversationDetail(
@@ -292,6 +302,9 @@ def list_my_conversations(
         viewer_id=current_user.id,
     )
     latest = chat_service.latest_messages(db, conversation_ids=conversation_ids)
+    latest_media = media_service.media_by_message_ids(
+        db, message_ids=[message.id for message in latest.values()]
+    )
     unread = chat_service.unread_counts(
         db, user_id=current_user.id, conversation_ids=conversation_ids
     )
@@ -301,13 +314,15 @@ def list_my_conversations(
         participant = participants.get(conversation.id)
         if participant is None:  # pragma: no cover - defensive: malformed row
             continue
+        last = latest.get(conversation.id)
         items.append(
             _conversation_summary(
                 conversation,
                 viewer=current_user,
                 participant=participant,
-                last=latest.get(conversation.id),
+                last=last,
                 unread_count=unread.get(conversation.id, 0),
+                media=latest_media.get(last.id) if last is not None else None,
             )
         )
 
@@ -351,10 +366,13 @@ def get_conversation(
     status_code=status.HTTP_201_CREATED,
     summary="Send a message",
     description=(
-        "Append a text message to a conversation I participate in. The body is "
-        "trimmed and must be 1-4000 characters; an empty or whitespace-only body "
-        "is rejected. Sending is refused when either participant has blocked the "
-        "other, even if the conversation already existed.\n\n"
+        "Append a message to a conversation I participate in. At least one of "
+        "``body`` and ``media_id`` is required; both may be sent together. The "
+        "body is trimmed and must be 1-4000 characters when present. "
+        "``media_id`` must be a file I uploaded to the **same** conversation and "
+        "must not already be attached. Sending is refused when either "
+        "participant has blocked the other, even if the conversation already "
+        "existed.\n\n"
         "The message is pushed to the other participant's live WebSocket "
         "connections (and to the sender's other devices). If the recipient has a "
         "live connection, the response's ``delivered_at`` is set; otherwise it "
@@ -365,6 +383,9 @@ def get_conversation(
         401: _UNAUTHORIZED_RESPONSE,
         403: _FORBIDDEN_RESPONSE,
         404: _NOT_FOUND_RESPONSE,
+        409: {
+            "description": "The media is already attached, or the idempotency key was reused.",
+        },
         422: _VALIDATION_RESPONSE,
         429: _RATE_LIMIT_RESPONSE,
     },
@@ -383,11 +404,20 @@ async def send_message(
     conversation = chat_service.require_membership(
         db, conversation_id=conversation_id, user_id=current_user.id
     )
+    media = None
+    if payload.media_id is not None:
+        media = media_service.require_owned_media(
+            db,
+            public_id=payload.media_id,
+            conversation_id=conversation.id,
+            uploader_id=current_user.id,
+        )
     message, created = chat_service.send_message(
         db,
         conversation=conversation,
         sender=current_user,
         body=payload.body,
+        media=media,
     )
 
     manager = getattr(request.app.state, "ws_manager", None)
@@ -407,7 +437,9 @@ async def send_message(
             db.flush()
             delivered_at = message.delivered_at
 
-    rendered = build_message(message, sender_username=current_user.username)
+    rendered = build_message(
+        message, sender_username=current_user.username, media=media
+    )
 
     if created and manager is not None:
         # Make the status durable before telling anyone about it.
@@ -534,6 +566,9 @@ def list_messages(
     participant = chat_service.other_participant(
         db, conversation_id=conversation.id, viewer_id=current_user.id
     )
+    media_by_message = media_service.media_by_message_ids(
+        db, message_ids=[message.id for message in messages]
+    )
 
     items = [
         build_message(
@@ -543,6 +578,7 @@ def list_messages(
                 if message.sender_id == current_user.id
                 else participant.username
             ),
+            media=media_by_message.get(message.id),
         )
         for message in messages
     ]

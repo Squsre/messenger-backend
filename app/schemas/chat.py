@@ -12,14 +12,15 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.core.security import (
     MESSAGE_MAX_LENGTH,
     USERNAME_MAX_LENGTH,
     USERNAME_MIN_LENGTH,
 )
-from app.db.models import Message
+from app.db.models import Media, Message
+from app.schemas.media import MediaRead, build_media
 from app.schemas.user import UserPublic
 
 
@@ -37,30 +38,48 @@ class ConversationCreate(BaseModel):
 
 
 class MessageCreate(BaseModel):
-    """Send a text message.
+    """Send a message with text, media, or both.
 
-    The body is trimmed before it is stored, so a message never begins or ends
-    with whitespace, and a whitespace-only body is rejected. ``extra="forbid"``
-    means a client cannot smuggle in ``sender_id``, ``conversation_id`` or
-    ``created_at``.
+    At least one of ``body`` and ``media_id`` is required. The body is trimmed
+    before it is stored, so a message never begins or ends with whitespace, and
+    a whitespace-only body is rejected unless media is present (in which case it
+    becomes a media-only message). ``extra="forbid"`` means a client cannot
+    smuggle in ``sender_id``, ``conversation_id`` or ``created_at``.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    body: str = Field(
+    body: str | None = Field(
+        default=None,
         min_length=1,
         max_length=MESSAGE_MAX_LENGTH,
-        description="Message text (plain text, 1-4000 characters after trimming).",
+        description="Optional message text (1-4000 characters after trimming).",
         examples=["Hey, are we still on for tomorrow?"],
+    )
+    media_id: str | None = Field(
+        default=None,
+        min_length=8,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_-]+$",
+        description=(
+            "Optional id returned by the media upload endpoint. It must belong "
+            "to the same conversation and to the sender, and be unattached."
+        ),
     )
 
     @field_validator("body")
     @classmethod
-    def _not_blank(cls, value: str) -> str:
+    def _normalise_body(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         text = value.strip()
-        if not text:
-            raise ValueError("Message body must not be empty.")
-        return text
+        return text or None
+
+    @model_validator(mode="after")
+    def _requires_content(self) -> "MessageCreate":
+        if self.body is None and self.media_id is None:
+            raise ValueError("A message must include text, media, or both.")
+        return self
 
 
 class MessageRead(BaseModel):
@@ -69,7 +88,14 @@ class MessageRead(BaseModel):
     id: int
     conversation_id: int
     sender_username: str = Field(description="Who sent the message.")
-    body: str
+    body: str | None = Field(
+        default=None,
+        description="Message text; null for a media-only message.",
+    )
+    media: MediaRead | None = Field(
+        default=None,
+        description="Attached media, or null for a text-only message.",
+    )
     created_at: datetime
     delivered_at: datetime | None = Field(
         default=None,
@@ -159,13 +185,27 @@ class MessagePage(BaseModel):
     offset: int = Field(description="Number of items skipped.")
 
 
-def build_message(message: Message, *, sender_username: str) -> MessageRead:
-    """Convert a stored message to its API representation."""
+def build_message(
+    message: Message,
+    *,
+    sender_username: str,
+    media: Media | None = None,
+) -> MessageRead:
+    """Convert a stored message to its API representation.
+
+    ``media`` is passed explicitly (instead of reading a relationship) so a page
+    of messages can be rendered from one bulk query.
+    """
     return MessageRead(
         id=message.id,
         conversation_id=message.conversation_id,
         sender_username=sender_username,
         body=message.body,
+        media=(
+            build_media(media, uploader_username=sender_username)
+            if media is not None
+            else None
+        ),
         created_at=message.created_at,
         delivered_at=message.delivered_at,
         read_at=message.read_at,

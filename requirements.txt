@@ -3,6 +3,8 @@ uvicorn[standard]==0.34.0
 pydantic==2.10.4
 pydantic-settings==2.7.0
 email-validator==2.2.0
+# Multipart parsing for authenticated media uploads (FastAPI/Starlette).
+python-multipart==0.0.20
 SQLAlchemy==2.0.36
 alembic==1.14.0
 # Authentication: Argon2id password hashing and JWT signing.

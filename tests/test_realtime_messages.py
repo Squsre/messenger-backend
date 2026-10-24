@@ -199,6 +199,7 @@ def test_ack_shape_has_no_numeric_user_ids(client, api) -> None:
         "conversation_id",
         "sender_username",
         "body",
+        "media",
         "created_at",
         "delivered_at",
         "read_at",

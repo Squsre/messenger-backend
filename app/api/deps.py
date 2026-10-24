@@ -37,6 +37,7 @@ from app.db.models import User
 from app.db.session import get_db
 from app.services.auth import resolve_user_from_claims
 from app.services.email import EmailService, build_email_service
+from app.services.storage import StorageService
 from app.services.user import normalize_email
 
 # ``auto_error=False`` lets us raise our own 401 with a consistent body and
@@ -107,6 +108,14 @@ def get_email_service(
     """
     service = getattr(request.app.state, "email_service", None)
     return service if service is not None else build_email_service(settings)
+
+
+def get_storage(request: Request) -> StorageService:
+    """Return the storage backend attached to the application at startup."""
+    storage = getattr(request.app.state, "storage", None)
+    if storage is None:  # pragma: no cover - every app factory sets this
+        raise RuntimeError("media storage is not configured")
+    return storage
 
 
 def get_client_ip(request: Request) -> str | None:

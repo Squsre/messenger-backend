@@ -32,6 +32,11 @@ ALLOWED_JWT_ALGORITHMS: frozenset[str] = frozenset({"HS256", "HS384", "HS512"})
 # Email delivery backends. ``console`` is development-only.
 ALLOWED_EMAIL_BACKENDS: frozenset[str] = frozenset({"console", "smtp", "disabled"})
 
+# Media backends. Local disk is the only implementation in this phase; the
+# interface is deliberately backend-agnostic so MinIO/S3 can be added later
+# without changing the HTTP contract. See app/services/storage.py.
+ALLOWED_MEDIA_STORAGE_BACKENDS: frozenset[str] = frozenset({"local"})
+
 # Substrings that identify the throw-away placeholder shipped in `.env.example`.
 # They are rejected outside local development so an insecure secret cannot reach
 # a real environment by accident.
@@ -162,6 +167,41 @@ class Settings(DatabaseSettings):
     conversation_max_limit: int = Field(default=50, ge=1, le=100)
     message_max_limit: int = Field(default=100, ge=1, le=200)
 
+    # --- Media (uploaded photos and files) ---
+    # Local disk now; the same interface can be backed by MinIO/S3 later. The
+    # directory is deliberately outside the application package and is ignored
+    # by Git when the default ``var/media`` is used.
+    media_storage_backend: str = Field(
+        default="local",
+        description="Media storage backend (currently only 'local').",
+    )
+    media_storage_path: str = Field(
+        default="var/media",
+        description="Directory for locally stored media (not inside the app package).",
+    )
+    # Per-file ceiling. Enforced before content validation and again by the
+    # bounded read, so a client cannot force the server to buffer more.
+    media_max_upload_bytes: int = Field(
+        default=10 * 1024 * 1024,
+        ge=1,
+        le=200 * 1024 * 1024,
+        description="Maximum size of one uploaded file in bytes.",
+    )
+    media_max_files_per_request: int = Field(
+        default=4,
+        ge=1,
+        le=10,
+        description="Maximum number of files accepted by one upload request.",
+    )
+    # Pictures are never decoded (no Pillow, no decompression bombs); only the
+    # header dimensions are read. Absurd dimensions are refused up front.
+    media_max_image_dimension: int = Field(
+        default=20_000,
+        ge=1,
+        le=100_000,
+        description="Maximum accepted image width/height from file headers.",
+    )
+
     # --- Realtime (WebSocket) ---
     # Seconds a freshly accepted socket may wait for its auth frame. Kept short
     # on purpose: an unauthenticated socket only consumes a pending slot.
@@ -226,6 +266,8 @@ class Settings(DatabaseSettings):
     contact_rate_limit_window_seconds: int = Field(default=60, ge=1)
     chat_rate_limit_attempts: int = Field(default=120, ge=1)
     chat_rate_limit_window_seconds: int = Field(default=60, ge=1)
+    media_rate_limit_attempts: int = Field(default=60, ge=1)
+    media_rate_limit_window_seconds: int = Field(default=60, ge=1)
 
     # --- CORS ---
     # ``NoDecode`` keeps pydantic-settings from JSON-decoding the value, so a
@@ -278,6 +320,24 @@ class Settings(DatabaseSettings):
                 "allowed outside local environments"
             )
         return backend
+
+    @field_validator("media_storage_backend")
+    @classmethod
+    def _validate_media_backend(cls, value: str) -> str:
+        """Only advertise backends that actually have an implementation."""
+        backend = value.strip().lower()
+        if backend not in ALLOWED_MEDIA_STORAGE_BACKENDS:
+            allowed = ", ".join(sorted(ALLOWED_MEDIA_STORAGE_BACKENDS))
+            raise ValueError(f"media_storage_backend must be one of: {allowed}")
+        return backend
+
+    @field_validator("media_storage_path")
+    @classmethod
+    def _validate_media_storage_path(cls, value: str) -> str:
+        path = value.strip()
+        if not path:
+            raise ValueError("media_storage_path must not be empty")
+        return path
 
     @field_validator("jwt_secret_key")
     @classmethod

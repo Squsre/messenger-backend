@@ -28,6 +28,13 @@ in a unique index, so ordinary sends are unaffected.
 The body is validated twice on purpose: by the request schema (a friendly
 ``422``) and by CHECK constraints here, so an empty or oversized row cannot be
 written even if application code is bypassed.
+
+Since phase 10 the body is **optional**: a message may carry media, text, or
+both. The application enforces "text or media" before inserting; the CHECK
+constraints still reject a present-but-blank or oversized body. A cross-table
+"must have media when body is NULL" rule cannot be expressed with this schema
+(the media row points at the message, not the other way round), so it remains an
+application invariant.
 """
 
 from __future__ import annotations
@@ -46,8 +53,13 @@ class Message(Base):
 
     __tablename__ = "messages"
     __table_args__ = (
-        CheckConstraint("length(trim(body)) > 0", name="body_not_blank"),
-        CheckConstraint(f"length(body) <= {MESSAGE_MAX_LENGTH}", name="body_too_long"),
+        CheckConstraint(
+            "body IS NULL OR length(trim(body)) > 0", name="body_not_blank"
+        ),
+        CheckConstraint(
+            f"body IS NULL OR length(body) <= {MESSAGE_MAX_LENGTH}",
+            name="body_too_long",
+        ),
         # The history query is always "this conversation, in id order".
         Index("ix_messages_conversation_id_id", "conversation_id", "id"),
         # A client retry (same sender, conversation and key) must not duplicate.
@@ -72,7 +84,10 @@ class Message(Base):
         nullable=False,
         index=True,
     )
-    body: Mapped[str] = mapped_column(String(MESSAGE_MAX_LENGTH), nullable=False)
+    #: ``None`` for a media-only message; text and media may coexist.
+    body: Mapped[str | None] = mapped_column(
+        String(MESSAGE_MAX_LENGTH), nullable=True
+    )
     #: Optional client-supplied idempotency key (see the module docstring).
     client_message_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(

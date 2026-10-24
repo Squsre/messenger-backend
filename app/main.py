@@ -26,6 +26,7 @@ from app.db.session import Database
 from app.schemas.health import RootResponse
 from app.services.email import build_email_service
 from app.services.realtime import ConnectionManager
+from app.services.storage import build_storage
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,14 @@ OPENAPI_TAGS = [
             "One-to-one private conversations and messages, including delivery "
             "and read status, unread counts and read markers. Realtime delivery "
             "and ephemeral typing indicators use the WebSocket at /api/v1/ws."
+        ),
+    },
+    {
+        "name": "media",
+        "description": (
+            "Authenticated upload, metadata, download, attachment and deletion of "
+            "conversation-scoped photos and files. Binaries live behind a storage "
+            "interface (local disk in this phase), never in the database."
         ),
     },
 ]
@@ -118,6 +127,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             max_requests=settings.chat_rate_limit_attempts,
             window_seconds=settings.chat_rate_limit_window_seconds,
         ),
+        "media": SlidingWindowRateLimiter(
+            max_requests=settings.media_rate_limit_attempts,
+            window_seconds=settings.media_rate_limit_window_seconds,
+        ),
         "ws": SlidingWindowRateLimiter(
             max_requests=settings.ws_message_rate_limit_attempts,
             window_seconds=settings.ws_message_rate_limit_window_seconds,
@@ -133,6 +146,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
 
     email_service = build_email_service(settings)
+    # Local disk by default; the endpoints only see the StorageService protocol.
+    storage = build_storage(settings)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -169,6 +184,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.login_rate_limiter = login_rate_limiter
     app.state.rate_limiters = rate_limiters
     app.state.email_service = email_service
+    app.state.storage = storage
     app.state.ws_manager = ws_manager
 
     if settings.cors_origins:

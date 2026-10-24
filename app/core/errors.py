@@ -80,6 +80,20 @@ class ConflictError(AppError):
     code = "conflict"
 
 
+class PayloadTooLargeError(AppError):
+    """Raised when an uploaded file exceeds the configured size limit."""
+
+    status_code = status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
+    code = "payload_too_large"
+
+
+class UnsupportedMediaTypeError(AppError):
+    """Raised when an upload's extension, declared type or content is not allowed."""
+
+    status_code = status.HTTP_415_UNSUPPORTED_MEDIA_TYPE
+    code = "unsupported_media_type"
+
+
 class RateLimitError(AppError):
     """Raised when a client exceeds an allowed request rate."""
 

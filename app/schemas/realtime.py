@@ -11,8 +11,9 @@ Inbound
     Must be the **first** frame. The token is validated with the same four
     layers as the HTTP API. It never appears in the URL or in a log line.
 
-``{"type": "message", "conversation_id": 1, "body": "hi", "client_message_id": "..."}``
-    Send a message. ``client_message_id`` is optional and makes retries safe.
+``{"type": "message", "conversation_id": 1, "body": "hi", "media_id": "...", "client_message_id": "..."}``
+    Send a message with text, media, or both. ``client_message_id`` is optional
+    and makes retries safe.
 
 ``{"type": "read", "conversation_id": 1, "last_message_id": 42}``
     Mark incoming messages up to (and including) ``last_message_id`` as read.
@@ -31,9 +32,9 @@ Inbound
 
 Outbound
 --------
-``ready``, ``message``, ``ack``, ``delivered``, ``read``, ``typing``, ``ping``,
-``pong`` and ``error``. See the models below; the README has the same table plus
-examples.
+``ready``, ``message``, ``message_updated``, ``ack``, ``delivered``, ``read``,
+``typing``, ``ping``, ``pong`` and ``error``. See the models below; the README
+has the same table plus examples.
 """
 
 from __future__ import annotations
@@ -42,7 +43,14 @@ import json
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from app.core.security import (
     CLIENT_MESSAGE_ID_MAX_LENGTH,
@@ -84,7 +92,22 @@ class InboundMessage(BaseModel):
 
     type: Literal["message"]
     conversation_id: int = Field(ge=1)
-    body: str = Field(min_length=1, max_length=MESSAGE_MAX_LENGTH)
+    body: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=MESSAGE_MAX_LENGTH,
+        description="Optional text; a message needs text, media, or both.",
+    )
+    media_id: str | None = Field(
+        default=None,
+        min_length=8,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_-]+$",
+        description=(
+            "Optional id from the media upload endpoint; it must belong to this "
+            "conversation and to the sender, and be unattached."
+        ),
+    )
     client_message_id: str | None = Field(
         default=None,
         max_length=CLIENT_MESSAGE_ID_MAX_LENGTH,
@@ -96,11 +119,17 @@ class InboundMessage(BaseModel):
 
     @field_validator("body")
     @classmethod
-    def _not_blank(cls, value: str) -> str:
+    def _normalise_body(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         text = value.strip()
-        if not text:
-            raise ValueError("Message body must not be empty.")
-        return text
+        return text or None
+
+    @model_validator(mode="after")
+    def _requires_content(self) -> "InboundMessage":
+        if self.body is None and self.media_id is None:
+            raise ValueError("A message must include text, media, or both.")
+        return self
 
     @field_validator("client_message_id")
     @classmethod
@@ -211,6 +240,16 @@ class MessageEvent(BaseModel):
     """A stored message, fanned out to every member's live connections."""
 
     type: Literal["message"] = "message"
+    message: MessageRead
+
+
+class MessageUpdatedEvent(BaseModel):
+    """An existing message changed (currently: media was attached).
+
+    Clients should replace the message with the same id instead of appending it.
+    """
+
+    type: Literal["message_updated"] = "message_updated"
     message: MessageRead
 
 

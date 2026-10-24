@@ -121,7 +121,7 @@ def db_url(tmp_path) -> str:
 
 
 @pytest.fixture()
-def test_settings(db_url: str) -> Settings:
+def test_settings(db_url: str, tmp_path) -> Settings:
     """Deterministic settings used by the test-suite.
 
     The database URL points at a temporary file so tests never touch the real
@@ -149,6 +149,8 @@ def test_settings(db_url: str) -> Settings:
         email_backend="disabled",
         email_from="no-reply@messenger.test",
         public_base_url="http://testserver",
+        # Never write uploads into the repository during tests.
+        media_storage_path=str(tmp_path / "media"),
     )
 
 

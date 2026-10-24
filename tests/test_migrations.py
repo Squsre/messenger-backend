@@ -24,7 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 #: Revision created by the phase-3 migration; the base point for data-preservation
 #: tests, because it is the last schema that existed before the profile phase.
 AUTH_REVISION = "0002_create_users_and_token_blocklist"
-HEAD_REVISION = "0006_message_statuses"
+HEAD_REVISION = "0007_add_media"
 
 _USERNAME_PATTERN = re.compile(r"^[a-z0-9_]{3,32}$")
 
@@ -64,6 +64,7 @@ def test_upgrade_head_creates_schema(migration_url: str) -> None:
             "conversations",
             "conversation_members",
             "messages",
+            "media",
             "alembic_version",
         } <= tables
 
@@ -144,6 +145,38 @@ def test_upgrade_head_creates_schema(migration_url: str) -> None:
         assert {"id", "conversation_id", "sender_id", "body", "created_at"} <= message_columns
         assert "client_message_id" in message_columns
         assert {"delivered_at", "read_at"} <= message_columns
+        body_column = next(
+            column for column in inspector.get_columns("messages") if column["name"] == "body"
+        )
+        assert body_column["nullable"] is True
+
+        media_columns = {
+            column["name"] for column in inspector.get_columns("media")
+        }
+        assert {
+            "id",
+            "public_id",
+            "storage_key",
+            "original_filename",
+            "content_type",
+            "size_bytes",
+            "width",
+            "height",
+            "status",
+            "conversation_id",
+            "uploader_id",
+            "message_id",
+            "created_at",
+        } <= media_columns
+        media_checks = {
+            constraint["name"]
+            for constraint in inspector.get_check_constraints("media")
+        }
+        assert {
+            "ck_media_size_positive",
+            "ck_media_dimensions_valid",
+            "ck_media_status_allowed",
+        } <= media_checks
     finally:
         engine.dispose()
 
@@ -196,6 +229,10 @@ def test_migrations_do_not_rewrite_earlier_revisions() -> None:
     )
     assert 'revision: str = "0006_message_statuses"' in statuses
     assert "0007" not in statuses
+
+    media = (versions / "0007_add_media.py").read_text(encoding="utf-8")
+    assert 'revision: str = "0007_add_media"' in media
+    assert "0008" not in media
 
 
 def test_email_uniqueness_is_enforced_by_the_database(migration_url: str) -> None:
@@ -397,8 +434,10 @@ def test_upgrade_then_downgrade_to_base(migration_url: str) -> None:
         engine.dispose()
 
 
-def test_downgrade_one_step_removes_the_status_columns(migration_url: str) -> None:
-    """Rolling back only 0006 keeps every message and the idempotency key."""
+def test_downgrade_one_step_removes_media_and_restores_non_null_body(
+    migration_url: str,
+) -> None:
+    """Rolling back only 0007 drops media and restores the text-only body rule."""
     config = _alembic_config(migration_url)
     command.upgrade(config, "head")
     command.downgrade(config, "-1")
@@ -408,17 +447,40 @@ def test_downgrade_one_step_removes_the_status_columns(migration_url: str) -> No
         inspector = inspect(engine)
         tables = set(inspector.get_table_names())
         assert {"conversations", "conversation_members", "messages"} <= tables
+        assert "media" not in tables
 
-        message_columns = {column["name"] for column in inspector.get_columns("messages")}
-        assert "delivered_at" not in message_columns
-        assert "read_at" not in message_columns
-        assert "client_message_id" in message_columns
+        message_columns = {
+            column["name"]: column for column in inspector.get_columns("messages")
+        }
+        assert message_columns["body"]["nullable"] is False
+        assert {"delivered_at", "read_at", "client_message_id"} <= set(
+            message_columns
+        )
+
+        # The rebuild must preserve the foreign keys and indexes, not just the
+        # columns. This is the regression that a naive SQLite batch migration
+        # would silently lose.
+        foreign_keys = {
+            constraint["name"]
+            for constraint in inspector.get_foreign_keys("messages")
+        }
+        assert {
+            "fk_messages_conversation_id_conversations",
+            "fk_messages_sender_id_users",
+        } <= foreign_keys
+        indexes = {index["name"] for index in inspector.get_indexes("messages")}
+        assert {
+            "ix_messages_conversation_id",
+            "ix_messages_conversation_id_id",
+            "ix_messages_sender_id",
+            "uq_messages_conversation_sender_client",
+        } <= indexes
     finally:
         engine.dispose()
 
 
-def test_downgrade_two_steps_removes_the_idempotency_key(migration_url: str) -> None:
-    """Rolling back 0006 and 0005 still keeps every chat table and row."""
+def test_downgrade_two_steps_removes_the_status_columns(migration_url: str) -> None:
+    """Rolling back 0007 and 0006 keeps every message and the idempotency key."""
     config = _alembic_config(migration_url)
     command.upgrade(config, "head")
     command.downgrade(config, "-2")
@@ -428,6 +490,30 @@ def test_downgrade_two_steps_removes_the_idempotency_key(migration_url: str) -> 
         inspector = inspect(engine)
         tables = set(inspector.get_table_names())
         assert {"conversations", "conversation_members", "messages"} <= tables
+        assert "media" not in tables
+
+        message_columns = {column["name"] for column in inspector.get_columns("messages")}
+        assert "delivered_at" not in message_columns
+        assert "read_at" not in message_columns
+        assert "client_message_id" in message_columns
+    finally:
+        engine.dispose()
+
+
+def test_downgrade_three_steps_removes_the_idempotency_key(
+    migration_url: str,
+) -> None:
+    """Rolling back 0007-0005 still keeps every chat table and row."""
+    config = _alembic_config(migration_url)
+    command.upgrade(config, "head")
+    command.downgrade(config, "-3")
+
+    engine = create_db_engine(migration_url)
+    try:
+        inspector = inspect(engine)
+        tables = set(inspector.get_table_names())
+        assert {"conversations", "conversation_members", "messages"} <= tables
+        assert "media" not in tables
 
         message_columns = {column["name"] for column in inspector.get_columns("messages")}
         assert "client_message_id" not in message_columns
@@ -437,11 +523,13 @@ def test_downgrade_two_steps_removes_the_idempotency_key(migration_url: str) -> 
         engine.dispose()
 
 
-def test_downgrade_three_steps_removes_only_the_chat_tables(migration_url: str) -> None:
-    """Rolling back 0006, 0005 and 0004 keeps the phase-6 profile schema."""
+def test_downgrade_four_steps_removes_only_the_chat_tables(
+    migration_url: str,
+) -> None:
+    """Rolling back 0007-0004 keeps the phase-6 profile schema."""
     config = _alembic_config(migration_url)
     command.upgrade(config, "head")
-    command.downgrade(config, "-3")
+    command.downgrade(config, "-4")
 
     engine = create_db_engine(migration_url)
     try:
@@ -456,7 +544,12 @@ def test_downgrade_three_steps_removes_only_the_chat_tables(migration_url: str) 
             "contacts",
             "blocks",
         } <= tables
-        assert not {"conversations", "conversation_members", "messages"} & tables
+        assert not {
+            "conversations",
+            "conversation_members",
+            "messages",
+            "media",
+        } & tables
 
         # The profile columns from 0003 are untouched.
         user_columns = {column["name"] for column in inspector.get_columns("users")}
@@ -465,11 +558,11 @@ def test_downgrade_three_steps_removes_only_the_chat_tables(migration_url: str) 
         engine.dispose()
 
 
-def test_downgrade_four_steps_removes_the_profile_schema(migration_url: str) -> None:
-    """0003's downgrade still works now that 0004-0006 sit on top of it."""
+def test_downgrade_five_steps_removes_the_profile_schema(migration_url: str) -> None:
+    """0003's downgrade still works now that 0004-0007 sit on top of it."""
     config = _alembic_config(migration_url)
     command.upgrade(config, "head")
-    command.downgrade(config, "-4")
+    command.downgrade(config, "-5")
 
     engine = create_db_engine(migration_url)
     try:
@@ -484,6 +577,7 @@ def test_downgrade_four_steps_removes_the_profile_schema(migration_url: str) -> 
             "conversations",
             "conversation_members",
             "messages",
+            "media",
         } & tables
 
         user_columns = {column["name"] for column in inspector.get_columns("users")}
@@ -494,7 +588,7 @@ def test_downgrade_four_steps_removes_the_profile_schema(migration_url: str) -> 
 
 
 def test_status_migration_preserves_existing_messages(migration_url: str) -> None:
-    """0006 must only add nullable columns; existing chat rows survive."""
+    """0006 only adds nullable columns, and 0007 keeps every message row."""
     config = _alembic_config(migration_url)
     command.upgrade(config, "0005_message_client_id")
 
@@ -527,6 +621,14 @@ def test_status_migration_preserves_existing_messages(migration_url: str) -> Non
 
     engine = create_db_engine(migration_url)
     try:
+        inspector = inspect(engine)
+        body_column = next(
+            column
+            for column in inspector.get_columns("messages")
+            if column["name"] == "body"
+        )
+        assert body_column["nullable"] is True
+        assert "media" in inspector.get_table_names()
         with engine.connect() as connection:
             row = connection.execute(
                 text(
@@ -542,7 +644,7 @@ def test_status_migration_preserves_existing_messages(migration_url: str) -> Non
     finally:
         engine.dispose()
 
-    command.downgrade(config, "-1")
+    command.downgrade(config, "-2")
 
     engine = create_db_engine(migration_url)
     try:
@@ -654,3 +756,110 @@ def test_chat_constraints_are_enforced_by_the_database(migration_url: str) -> No
                     )
     finally:
         engine.dispose()
+
+
+def test_media_constraints_are_enforced_by_the_database(migration_url: str) -> None:
+    """Media rules hold even if a caller bypasses the service layer."""
+    command.upgrade(_alembic_config(migration_url), "head")
+
+    engine = create_db_engine(migration_url)
+    try:
+        with engine.begin() as connection:
+            for email, username in (
+                ("alice@example.com", "alice"),
+                ("bob@example.com", "bob"),
+            ):
+                connection.execute(
+                    text(
+                        "INSERT INTO users (email, username, hashed_password, is_active) "
+                        "VALUES (:email, :username, 'not-a-real-hash', 1)"
+                    ),
+                    {"email": email, "username": username},
+                )
+            connection.execute(text("INSERT INTO conversations (pair_key) VALUES ('1:2')"))
+            connection.execute(
+                text(
+                    "INSERT INTO messages (conversation_id, sender_id, body) "
+                    "VALUES (1, 1, 'with media')"
+                )
+            )
+
+        insert = text(
+            "INSERT INTO media "
+            "(public_id, storage_key, original_filename, content_type, size_bytes, "
+            " width, height, status, conversation_id, uploader_id, message_id) "
+            "VALUES (:public_id, :storage_key, 'photo.png', 'image/png', :size, "
+            "        :width, :height, :status, 1, 1, :message_id)"
+        )
+        valid = {
+            "public_id": "a" * 32,
+            "storage_key": "b" * 32 + ".png",
+            "size": 10,
+            "width": 1,
+            "height": 1,
+            "status": "ready",
+            "message_id": 1,
+        }
+        with engine.begin() as connection:
+            connection.execute(insert, valid)
+
+        # One attachment per message, enforced by a unique constraint.
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    insert,
+                    {
+                        **valid,
+                        "public_id": "c" * 32,
+                        "storage_key": "d" * 32 + ".png",
+                    },
+                )
+
+        # Zero/negative size, half-specified dimensions and unknown statuses are
+        # all refused structurally.
+        for overrides in (
+            {"size": 0, "message_id": None},
+            {"width": 1, "height": None, "message_id": None},
+            {"status": "processing", "message_id": None},
+        ):
+            with pytest.raises(IntegrityError):
+                with engine.begin() as connection:
+                    connection.execute(
+                        insert,
+                        {
+                            **valid,
+                            "public_id": "e" * 32,
+                            "storage_key": "f" * 32 + ".png",
+                            **overrides,
+                        },
+                    )
+    finally:
+        engine.dispose()
+
+
+def test_downgrade_refuses_to_drop_media_only_messages(migration_url: str) -> None:
+    """The 0007 downgrade must not silently delete or rewrite message content."""
+    config = _alembic_config(migration_url)
+    command.upgrade(config, "head")
+
+    engine = create_db_engine(migration_url)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO users (email, username, hashed_password, is_active) "
+                    "VALUES ('alice@example.com', 'alice', 'h', 1)"
+                )
+            )
+            connection.execute(text("INSERT INTO conversations (pair_key) VALUES ('1:1')"))
+            connection.execute(
+                text(
+                    "INSERT INTO messages (conversation_id, sender_id, body) "
+                    "VALUES (1, 1, NULL)"
+                )
+            )
+    finally:
+        engine.dispose()
+
+    with pytest.raises(RuntimeError, match="media-only messages"):
+        command.downgrade(config, "-1")

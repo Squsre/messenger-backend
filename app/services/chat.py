@@ -32,8 +32,9 @@ from app.core.errors import (
     NotFoundError,
 )
 from app.core.security import CLIENT_MESSAGE_ID_MAX_LENGTH, MESSAGE_MAX_LENGTH
-from app.db.models import Conversation, ConversationMember, Message, User
+from app.db.models import Conversation, ConversationMember, Media, Message, User
 from app.services.contact import is_blocked_between
+from app.services.media import attach_to_message
 
 
 def utcnow() -> datetime:
@@ -264,33 +265,49 @@ def send_message(
     *,
     conversation: Conversation,
     sender: User,
-    body: str,
+    body: str | None,
     client_message_id: str | None = None,
+    media: Media | None = None,
 ) -> tuple[Message, bool]:
-    """Append a message to a conversation.
+    """Append a text and/or media message to a conversation.
 
     Returns ``(message, created)``. ``created`` is ``False`` when the same
     sender already sent this ``client_message_id`` in this conversation — a
     realtime client retrying after a dropped connection gets the stored row back
     instead of a duplicate.
 
+    At least one of ``body`` and ``media`` must be present. Media must belong to
+    the same conversation, to the sender, be ready, and (for a new message) be
+    unattached. These checks are repeated here, not only in the endpoint, so the
+    WebSocket path and any future caller get the same rules.
+
     Access rules are checked **before** the idempotent lookup: after either side
     blocks the other, a retry is rejected with ``403`` and never returns the
     old message as if the send had just succeeded. Reusing a key with a
-    different body is ``409`` (see :func:`_replay`).
+    different body **or media** is ``409`` (see :func:`_replay`).
 
     The caller must already have been authorized with :func:`require_membership`.
     Blocking is re-checked here because it can happen *after* the conversation
     was created: a blocked pair may keep reading its history but cannot exchange
     new messages.
     """
-    text = body.strip()
-    if not text:
-        raise BadRequestError("Message body must not be empty.")
-    if len(text) > MESSAGE_MAX_LENGTH:
+    text = body.strip() if body is not None else None
+    if text == "":
+        text = None
+    if text is not None and len(text) > MESSAGE_MAX_LENGTH:
         raise BadRequestError(
             f"Message body must be at most {MESSAGE_MAX_LENGTH} characters."
         )
+    if text is None and media is None:
+        raise BadRequestError("A message must include text, media, or both.")
+
+    if media is not None:
+        if (
+            media.conversation_id != conversation.id
+            or media.uploader_id != sender.id
+            or media.status != "ready"
+        ):
+            raise NotFoundError("Media not found.")
 
     key = client_message_id.strip() if client_message_id else None
     if not key:
@@ -316,7 +333,10 @@ def send_message(
             _message_by_client_id(conversation.id, sender.id, key)
         ).scalar_one_or_none()
         if existing is not None:
-            return _replay(existing, text), False
+            return _replay(db, existing, text, media), False
+
+    if media is not None and media.message_id is not None:
+        raise ConflictError("This media is already attached to a message.")
 
     message = Message(
         conversation_id=conversation.id,
@@ -339,23 +359,40 @@ def send_message(
         existing = db.execute(
             _message_by_client_id(conversation.id, sender.id, key)
         ).scalar_one()
-        return _replay(existing, text), False
+        return _replay(db, existing, text, media), False
+
+    if media is not None:
+        attach_to_message(db, media=media, message=message)
 
     conversation.last_message_at = message.created_at
     db.flush()
     return message, True
 
 
-def _replay(existing: Message, body: str) -> Message:
+def _replay(
+    db: Session,
+    existing: Message,
+    body: str | None,
+    media: Media | None,
+) -> Message:
     """Validate an idempotent retry and return the stored message.
 
-    The first successful body for a ``client_message_id`` is immutable: a retry
-    with *different* text is a client bug or an attempt to smuggle new content
-    under an old key, so it is refused with ``409`` instead of being ignored.
+    The first successful payload for a ``client_message_id`` is immutable: a
+    retry with *different* text or a different attachment is a client bug or an
+    attempt to smuggle new content under an old key, so it is refused with
+    ``409`` instead of being ignored.
+
+    The stored media id is read as a scalar on purpose: the caller may already
+    have loaded the same ``Media`` row before a concurrent winner attached it,
+    and the identity map could otherwise hide that update.
     """
-    if existing.body != body:
+    stored_media_id = db.execute(
+        select(Media.id).where(Media.message_id == existing.id)
+    ).scalar_one_or_none()
+    requested_media_id = media.id if media is not None else None
+    if existing.body != body or stored_media_id != requested_media_id:
         raise ConflictError(
-            "client_message_id was already used with a different message body."
+            "client_message_id was already used with a different message."
         )
     return existing
 

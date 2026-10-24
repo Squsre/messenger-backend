@@ -66,10 +66,16 @@ def custom_client(test_settings: Settings, **overrides: object) -> Iterator[Test
 
 def message_frame(
     conversation_id: int,
-    body: str,
+    body: str | None,
     client_message_id: str | None = None,
+    *,
+    media_id: str | None = None,
 ) -> dict:
-    frame: dict = {"type": "message", "conversation_id": conversation_id, "body": body}
+    frame: dict = {"type": "message", "conversation_id": conversation_id}
+    if body is not None:
+        frame["body"] = body
+    if media_id is not None:
+        frame["media_id"] = media_id
     if client_message_id is not None:
         frame["client_message_id"] = client_message_id
     return frame

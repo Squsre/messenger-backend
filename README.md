@@ -15,9 +15,13 @@ Backend for the messenger project, built with **Python 3.11**, **FastAPI** and
 > shared pub/sub layer is still deferred).
 > **Stage 9** — delivery/read status, unread counters, ephemeral typing
 > indicators and WebSocket-driven last seen.
+> **Stage 10** — authenticated photo/file upload, validated storage, controlled
+> download, deletion of unattached uploads, and media attachments on messages.
 >
-> Groups, file uploads and E2EE are still to come. Two-factor authentication
-> and contact *requests* are deliberately deferred and documented in the roadmap.
+> Groups and E2EE are still to come. Two-factor authentication and contact
+> *requests* are deliberately deferred and documented in the roadmap. Files are
+> stored locally behind a `StorageService` interface; MinIO/S3 is a later
+> backend, not a requirement for this stage.
 
 ## Project layout
 
@@ -45,7 +49,8 @@ messenger/
 │   │       ├── block.py         # user-to-user blocks
 │   │       ├── conversation.py  # one-to-one conversations (unique pair_key)
 │   │       ├── conversation_member.py # participants
-│   │       └── message.py       # append-only messages + delivery/read status
+│   │       ├── message.py       # append-only messages + delivery/read status
+│   │       └── media.py         # conversation-scoped upload metadata (no binaries)
 │   ├── services/
 │   │   ├── user.py              # registration, lookup, username derivation
 │   │   ├── profile.py           # profile updates, visibility, last-seen heartbeat
@@ -56,7 +61,10 @@ messenger/
 │   │   ├── contact.py           # contacts, blocks, user search queries
 │   │   ├── auth.py              # shared token -> user resolution (HTTP + WebSocket)
 │   │   ├── realtime.py          # in-process WebSocket connection registry
-│   │   └── chat.py              # conversations, membership, messages, read watermarks
+│   │   ├── chat.py              # conversations, membership, messages, read watermarks
+│   │   ├── storage.py           # StorageService interface + local-disk backend
+│   │   ├── media_validation.py  # filename/content sniffing and dimension parsing
+│   │   └── media.py             # media rows, authorization, upload/attach rules
 │   ├── api/
 │   │   ├── deps.py              # token chain, per-scope rate limits, services
 │   │   └── v1/
@@ -69,6 +77,7 @@ messenger/
 │   │           ├── contacts.py  # /api/v1/contacts
 │   │           ├── blocks.py    # /api/v1/blocks
 │   │           ├── conversations.py # /api/v1/conversations
+│   │           ├── media.py    # /api/v1/media + conversation uploads
 │   │           └── realtime.py  # WS   /api/v1/ws
 │   └── schemas/
 │       ├── health.py            # response models
@@ -77,6 +86,7 @@ messenger/
 │       ├── account.py           # verification, password and session models
 │       ├── contact.py           # username reference model
 │       ├── chat.py              # conversation/message request + response models
+│       ├── media.py             # media metadata + attach request models
 │       └── realtime.py          # WebSocket frame schemas + parser
 ├── migrations/                  # Alembic environment
 │   ├── env.py
@@ -87,7 +97,8 @@ messenger/
 │       ├── 0003_add_profiles_and_social.py
 │       ├── 0004_add_conversations_and_messages.py
 │       ├── 0005_add_message_client_id.py
-│       └── 0006_add_message_statuses.py
+│       ├── 0006_add_message_statuses.py
+│       └── 0007_add_media.py
 ├── tests/
 │   ├── conftest.py              # fixtures + register/login and email helpers
 │   ├── test_app.py              # startup, docs, wiring
@@ -113,7 +124,10 @@ messenger/
 │   ├── test_realtime_access.py  # membership, blocks, conversation isolation
 │   ├── test_realtime_limits.py  # connection cap, rate limit, heartbeat, manager
 │   ├── test_realtime_hardening.py # periodic revalidation, pending caps, retries
-│   └── test_realtime_status.py  # delivered/read events, typing indicators
+│   ├── test_realtime_status.py  # delivered/read events, typing indicators
+│   ├── _media.py               # tiny valid image/PDF/CSV upload helpers (not collected)
+│   ├── test_media.py           # upload validation, storage, auth, delete, cleanup
+│   └── test_media_messages.py  # send/attach media, history, WS, idempotency
 ├── alembic.ini
 ├── .env.example
 ├── .gitignore
@@ -162,7 +176,7 @@ SQLite is used by default and lives at `./messenger.db` (configurable through
 The database URL is read from `DATABASE_URL` (via `.env`), so the same commands
 work unchanged after switching to PostgreSQL.
 
-Current head: **`0006_message_statuses`**. Apply it to an existing
+Current head: **`0007_add_media`**. Apply it to an existing
 database (created by an earlier stage) with a single `alembic upgrade head`:
 
 | Revision | What it adds |
@@ -173,6 +187,7 @@ database (created by an earlier stage) with a single `alembic upgrade head`:
 | `0004_add_conversations` | `conversations`, `conversation_members`, `messages` (one-to-one chat). |
 | `0005_message_client_id` | `messages.client_message_id` plus the unique index that makes realtime retries idempotent. |
 | `0006_message_statuses` | `messages.delivered_at` and `messages.read_at` (recipient delivery/read timestamps). |
+| `0007_add_media` | `media` (conversation-scoped upload metadata) and a nullable `messages.body` so a message can be media-only. |
 
 `0003` is written to be safe on a database that already contains accounts:
 `users.username` is added **nullable**, every existing account is backfilled
@@ -194,12 +209,22 @@ Every existing message starts as "sent, not delivered/read"; no row is rewritten
 and no constraint or index is touched. `downgrade` removes only those two
 columns, never the messages.
 
-> **Rollback warning:** from `0006`, `alembic downgrade -1` only removes the
-> status timestamps; `-2` additionally removes the idempotency key. `-3` drops
-> the three chat tables *and the messages they hold*; `-4` drops the profile,
-> verification and session columns *and their data*. All of these are exercised
-> by the test suite, but do not run them on a production database that has real
-> data without a backup.
+`0007` adds the `media` table and makes `messages.body` **nullable** so a
+message can be media-only. SQLite cannot change nullability or replace a CHECK
+constraint in place, so the migration rebuilds `messages` on SQLite while copying
+every row, primary key, foreign key, CHECK constraint and index. `media` is
+created after the rebuild, and the upgrade is safe on a populated database.
+Downgrading refuses if any `body IS NULL` row exists instead of deleting
+messages or inventing placeholder text; add text to those messages first or
+restore a backup.
+
+> **Rollback warning:** from `0007`, `alembic downgrade -1` drops `media` and
+> restores `messages.body NOT NULL` (refusing if media-only messages exist);
+> `-2` additionally removes the status timestamps; `-3` removes the idempotency
+> key. `-4` drops the three chat tables *and the messages they hold*; `-5` drops
+> the profile, verification and session columns *and their data*. All of these
+> are exercised by the test suite, but do not run them on a production database
+> that has real data without a backup.
 
 
 ### Session usage in future endpoints
@@ -593,17 +618,27 @@ caller (messages from the other participant that have not been read).
 
 ### Messages
 
-A message body is plain text, trimmed before storage, **1–4000 characters**
+A message may contain **text, media, or both**; at least one is required. A
+text body is plain text, trimmed before storage, **1–4000 characters**
 (`MESSAGE_MAX_LENGTH` in `app/core/security.py`). Empty and whitespace-only
-bodies are `422`, as is any attempt to set `sender_id`/`created_at` (the request
-schema forbids unknown fields). The same limits are enforced by `CHECK`
-constraints on the table, so they hold even if application code is bypassed.
+bodies are `422` unless media is attached (then they become a media-only
+message), as is any attempt to set `sender_id`/`created_at` (the request schema
+forbids unknown fields). The same limits are enforced by `CHECK` constraints on
+the table, so they hold even if application code is bypassed; the nullable
+`body` lets a media-only row store `NULL`.
+
+`media_id` is optional. When present it must be an opaque id returned by the
+upload endpoint for **the same conversation and the same uploader**, and must not
+already be attached. A message holds at most one attachment. The response
+contains `body: null` for a media-only message and a `media` object (or `null`)
+alongside the existing fields.
 
 History is returned **oldest first** and is paged with `limit`/`offset`
 (`limit` is capped by `MESSAGE_MAX_LIMIT`). Ordering is by the monotonic message
 `id`, which is both chronological and stable: timestamps can collide within a
 second, ids cannot. Messages are append-only in this phase — there is no edit or
-delete endpoint.
+delete endpoint. Uploads can be attached to an existing message they belong to;
+the message itself is never rewritten, only its media link is added.
 
 ### Delivery, read status and unread counts
 
@@ -651,11 +686,159 @@ conversation exists:
 Chat requests share one per-scope rate limiter (`CHAT_RATE_LIMIT_ATTEMPTS` /
 `CHAT_RATE_LIMIT_WINDOW_SECONDS`), keyed by user id.
 
-The conversation list is built with four queries per page (conversations,
-participants, last messages, unread counts) instead of one per item, so paging
-does not turn into an N+1. Realtime delivery, delivery/read receipts, typing
-indicators and unread counters are described in the next section; edits/deletes
-and attachments remain out of scope.
+The conversation list is built with five queries per page (conversations,
+participants, last messages, last-message media, unread counts) instead of one
+per item, so paging does not turn into an N+1. Realtime delivery, delivery/read
+receipts, typing indicators and unread counters are described in the next
+section. Message edits and deletes remain out of scope; media attachments are
+described under **Media attachments**.
+
+## Media attachments
+
+Photos and files are uploaded over HTTP, stored outside the database, and then
+referenced from a message by an opaque id. The WebSocket never carries file
+bytes; it carries the same `media` metadata as the HTTP response.
+
+| Method   | Path                                             | Description |
+| -------- | ------------------------------------------------ | ----------- |
+| `POST`   | `/api/v1/conversations/{conversation_id}/media`  | Upload 1..N files to a conversation. |
+| `GET`    | `/api/v1/media/{media_id}`                       | Metadata for a file I can see. |
+| `GET`    | `/api/v1/media/{media_id}/content`               | Download the bytes (Bearer auth). |
+| `DELETE` | `/api/v1/media/{media_id}`                       | Delete one of my unattached uploads. |
+| `POST`   | `/api/v1/media/{media_id}/attach`                | Attach an upload to one of my messages. |
+
+### Upload
+
+The multipart field is **`files`** (repeat it for a batch). The response is
+`201` with the same metadata shape used inside messages:
+
+```json
+{
+  "items": [
+    {
+      "id": "7f1c0f4e8a2b4c6d9e0f1a2b3c4d5e6f",
+      "conversation_id": 1,
+      "uploader_username": "alice",
+      "filename": "holiday photo.png",
+      "content_type": "image/png",
+      "size_bytes": 68,
+      "width": 1,
+      "height": 1,
+      "status": "ready",
+      "message_id": null,
+      "created_at": "2026-10-24T12:00:00Z"
+    }
+  ]
+}
+```
+
+```powershell
+curl.exe -s -X POST "http://127.0.0.1:8000/api/v1/conversations/1/media" `
+  -H "Authorization: Bearer $env:TOKEN" `
+  -F "files=@C:\path\to\photo.png;type=image/png"
+```
+
+Send text and media together, or media alone:
+
+```json
+{ "body": "look at this", "media_id": "7f1c..." }
+{ "media_id": "7f1c..." }
+```
+
+Download, attach, or delete later:
+
+```powershell
+curl.exe -s "http://127.0.0.1:8000/api/v1/media/7f1c.../content" `
+  -H "Authorization: Bearer $env:TOKEN" -o photo.png
+
+curl.exe -s -X POST "http://127.0.0.1:8000/api/v1/media/7f1c.../attach" `
+  -H "Authorization: Bearer $env:TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{"message_id": 42}'
+
+curl.exe -s -X DELETE "http://127.0.0.1:8000/api/v1/media/7f1c..." `
+  -H "Authorization: Bearer $env:TOKEN"
+```
+
+The storage key and internal integer id are **never** returned. `id` is 128
+random bits rendered as 32 hex characters; knowing one id does not reveal any
+other. `filename` is a sanitised display label only.
+
+### Allowed formats and limits
+
+| Category | Extensions | Detected type |
+| -------- | ---------- | ------------- |
+| Images | `.jpg`, `.jpeg`, `.png`, `.gif`, `.webp` | `image/jpeg`, `image/png`, `image/gif`, `image/webp` |
+| Documents | `.pdf` | `application/pdf` |
+| Text | `.txt`, `.csv` | `text/plain`, `text/csv` |
+
+* Per-file size: **`MEDIA_MAX_UPLOAD_BYTES`**, default **10 MiB**.
+* Files per request: **`MEDIA_MAX_FILES_PER_REQUEST`**, default **4**.
+* Image width/height from the header: at most
+  **`MEDIA_MAX_IMAGE_DIMENSION`**, default **20,000**.
+* Empty files are `400`; an oversized file is `413`.
+* The extension must be on the allow-list, the declared `Content-Type` must
+  agree with the bytes (an absent type or `application/octet-stream` is
+  tolerated because the bytes are still checked), and the signature must match.
+* Executables, archives, HTML, SVG, scripts, unknown binary data and images
+  without usable header dimensions are `415`. A PNG renamed to `.pdf` is
+  rejected; a text file with invalid UTF-8 or NUL bytes is rejected.
+* Filenames containing path separators, `..`, a drive/colon, control/format
+  characters or a trailing dot/space are `400`. They are never used to build a
+  path anyway.
+* Images are **not decoded**: only bounded header fields (PNG IHDR, JPEG SOF,
+  GIF logical screen, WebP VP8/VP8L/VP8X) are read. There is no Pillow
+  dependency, no thumbnail, no EXIF rewriting and no decompression-bomb CPU
+  cost. Consequently there is no server-side thumbnail or malware scan in this
+  phase.
+
+### Storage design
+
+`app/services/storage.py` defines a small `StorageService` protocol
+(`save`, `read`, `delete`, `exists`). `LocalStorage` is the only implementation
+now: files live under `MEDIA_STORAGE_PATH` (default `var/media`, outside the
+application package and ignored by Git), sharded as
+`<root>/<first-2>/<next-2>/<random-key>.<detected-extension>`. Writes go to a
+temporary file in the same directory and are atomically renamed; permissions
+are tightened to `0600` on POSIX. A malformed key read from a corrupt database
+row is rejected before it becomes a path.
+
+Only metadata is stored in SQL (the `media` table); no BLOB column exists.
+Uploads write the object first and then commit the row, and remove every object
+written by the request if storage or the database fails. A process crash between
+the two steps can still leave an orphan file; a periodic sweeper is the planned
+operational follow-up. Deleting an unattached upload removes the object and then
+the row; if the object is already missing, the row can still be cleaned up.
+
+A future MinIO/S3 backend only needs to implement the same four methods and a
+`build_storage()` branch (for example `MEDIA_STORAGE_BACKEND=s3` plus bucket
+settings). The HTTP contract, database schema and message payloads stay
+unchanged. No S3/MinIO service is added in this phase.
+
+### Download, deletion and attachment
+
+* `GET /media/{id}` and `/content` require a normal Bearer token and conversation
+  membership. A non-member gets **`404`**, never `403`, so ids cannot be probed.
+  A database row with a missing object also returns `404`.
+* Downloads are sent as `Content-Disposition: attachment` with
+  `X-Content-Type-Options: nosniff`, `Content-Security-Policy: sandbox` and
+  `Cache-Control: private, no-store`. There is no `Range` support yet, so large
+  files are returned in one response.
+* `DELETE` is uploader-only and refuses attached media with `409`; there is no
+  detach endpoint in this phase. The uploader may delete an unattached file even
+  if the recipient could otherwise see the conversation.
+* `POST /media/{id}/attach` with `{"message_id": 42}` attaches an owned,
+  unattached file to a message **the caller sent in the same conversation**.
+  Attaching twice, or attaching to a message that already has media, is `409`.
+  The block rules are re-checked: a blocked pair gets `403` and the upload stays
+  unattached. The change is broadcast to both participants as `message_updated`
+  after the commit.
+* Media routes share the `media` per-user rate limiter
+  (`MEDIA_RATE_LIMIT_ATTEMPTS` / `MEDIA_RATE_LIMIT_WINDOW_SECONDS`, default
+  60/60 s). Errors use the normal envelope: `400` bad filename/empty/too many
+  files, `401` auth, `403` non-uploader delete or blocked attach, `404`
+  hidden/missing, `409` conflict, `413` too large, `415` unsupported type, `429`
+  rate limit.
 
 ## Realtime chat (WebSocket)
 
@@ -704,8 +887,9 @@ Server → client:
 
 ```json
 { "type": "ready", "connection_id": "8f…", "user": { "username": "alice", "display_name": null, "bio": null, "last_seen_at": "…", "created_at": "…", "show_last_seen": true, "profile_visibility": "public", "avatar_key": null }, "conversations": [1, 2], "server_time": "2026-10-20T12:00:00Z" }
-{ "type": "message", "message": { "id": 7, "conversation_id": 1, "sender_username": "alice", "body": "hi", "created_at": "2026-10-20T12:00:00Z", "delivered_at": "2026-10-20T12:00:01Z", "read_at": null } }
-{ "type": "ack", "client_message_id": "retry-1", "duplicate": false, "message": { "id": 7, "conversation_id": 1, "sender_username": "alice", "body": "hi", "created_at": "…", "delivered_at": "…", "read_at": null } }
+{ "type": "message", "message": { "id": 7, "conversation_id": 1, "sender_username": "alice", "body": "hi", "media": null, "created_at": "2026-10-20T12:00:00Z", "delivered_at": "2026-10-20T12:00:01Z", "read_at": null } }
+{ "type": "message_updated", "message": { "id": 7, "conversation_id": 1, "sender_username": "alice", "body": "hi", "media": { "id": "7f1c…", "content_type": "image/png", "filename": "photo.png", "message_id": 7 }, "created_at": "…", "delivered_at": "…", "read_at": null } }
+{ "type": "ack", "client_message_id": "retry-1", "duplicate": false, "message": { "id": 7, "conversation_id": 1, "sender_username": "alice", "body": "hi", "media": null, "created_at": "…", "delivered_at": "…", "read_at": null } }
 { "type": "delivered", "conversation_id": 1, "message_id": 7, "delivered_at": "2026-10-20T12:00:01Z" }
 { "type": "read", "conversation_id": 1, "message_id": 7, "reader_username": "bob", "read_at": "2026-10-20T12:03:00Z" }
 { "type": "typing", "conversation_id": 1, "username": "alice", "is_typing": true, "expires_in_seconds": 5 }
@@ -718,7 +902,7 @@ Client → server:
 
 ```json
 { "type": "auth", "token": "…" }
-{ "type": "message", "conversation_id": 1, "body": "hi", "client_message_id": "retry-1" }
+{ "type": "message", "conversation_id": 1, "body": "hi", "media_id": "7f1c…", "client_message_id": "retry-1" }
 { "type": "read", "conversation_id": 1, "last_message_id": 7 }
 { "type": "typing", "conversation_id": 1, "is_typing": true }
 { "type": "ping" }
@@ -730,9 +914,11 @@ including `message_id` has that status. Clients can apply them with a single
 update instead of tracking per-message rows. The `read` event is sent to both
 participants' connections (the initiating socket can treat it as the
 acknowledgement of its `read` frame), while `delivered` goes only to the sender's
-devices. `typing` is forwarded only to the other participant and is **never
-stored**; `is_typing: false` clears it, and `expires_in_seconds` lets a client
-hide a stale indicator even if the stop frame is lost.
+devices. `message_updated` is emitted after media is attached to an existing
+message; clients should replace the message with the same `id` rather than append
+it. `typing` is forwarded only to the other participant and is **never stored**;
+`is_typing: false` clears it, and `expires_in_seconds` lets a client hide a stale
+indicator even if the stop frame is lost.
 
 `typing` frames are throttled per connection (`WS_TYPING_MIN_INTERVAL_SECONDS`,
 default 1 s); a stop frame is never throttled. Read frames have their own
@@ -746,14 +932,17 @@ instead of creating a second row; the unique index on
 `(conversation_id, sender_id, client_message_id)` guarantees this even under a
 race (the losing insert is rolled back inside a savepoint and the stored row is
 returned). Only the first successful send is fanned out, so other devices do not
-see a duplicate.
+see a duplicate. A retry must repeat the same text **and the same `media_id`**;
+switching either is a conflict, so an old key cannot be used to smuggle new
+content.
 
 **Retries versus blocks.** Access rules are evaluated *before* the idempotent
 lookup. If either participant has blocked the other, a retry is answered with
 `forbidden` (`403`) — it does **not** replay the old message as if the send had
 just succeeded. The stored message stays in the history. Reusing a key with a
-*different* body is rejected with `conflict` (`409`); the first accepted body for
-a key is immutable and a retry cannot smuggle new text under an old key.
+*different* body or a different attachment is rejected with `conflict` (`409`);
+the first accepted payload for a key is immutable and a retry cannot smuggle new
+text or media under an old key.
 
 Frame errors never echo the payload, so a malformed auth frame cannot leak its
 token into a response or a log line.
@@ -763,8 +952,9 @@ token into a response or a log line.
 * The sender is always the authenticated account. `sender_id`, `created_at` and
   other server-owned fields are rejected (`extra="forbid"`), as are non-object
   JSON, unknown `type` values and binary frames.
-* Sending goes through the same service as `POST …/messages`: trimmed 1–4000
-  character bodies, membership check (non-members get `not_found`, never
+* Sending goes through the same service as `POST …/messages`: optional text
+  (1–4000 characters when present), optional `media_id` owned by the sender in
+  the same conversation, membership check (non-members get `not_found`, never
   "forbidden") and the phase-6 block rules (a blocked pair gets `forbidden` and
   nothing is stored). The block check runs before any idempotent replay, so a
   blocked retry cannot return a success-shaped `ack`.
@@ -882,14 +1072,18 @@ Example health response:
 python -m pytest
 ```
 
-Tests never touch `messenger.db`: each one gets a temporary SQLite file. The
-migration tests run the real `alembic upgrade`/`downgrade` commands against a
-throw-away database and additionally assert that the migrated schema matches
-the ORM models (no drift); they also verify that the `0003` upgrade backfills a
-unique username for every pre-existing account and preserves existing rows, that
-`0004` upgrades and rolls back cleanly, that `0006` only adds nullable status
-columns (existing messages survive both directions), and that earlier migrations
-are never rewritten. Authentication tests cover registration, login, token
+Tests never touch `messenger.db`: each one gets a temporary SQLite file. Media
+tests also point `MEDIA_STORAGE_PATH` at a per-test temporary directory, so the
+suite never reads or writes real user uploads. The migration tests run the real
+`alembic upgrade`/`downgrade` commands against a throw-away database and
+additionally assert that the migrated schema matches the ORM models (no drift);
+they also verify that the `0003` upgrade backfills a unique username for every
+pre-existing account and preserves existing rows, that `0004` upgrades and rolls
+back cleanly, that `0006` only adds nullable status
+columns (existing messages survive both directions), that `0007` rebuilds
+`messages` without losing rows/foreign keys/indexes and refuses a downgrade when
+media-only rows exist, and that earlier migrations are never rewritten.
+Authentication tests cover registration, login, token
 validation
 (valid / invalid / expired), `/me`, logout and revocation, disabled accounts, the
 password policy, rate limiting and the guarantee that no raw password ever
@@ -915,7 +1109,14 @@ foreign/unknown message ids), unread counts, idempotent reads, WS-driven last se
 including the `show_last_seen` privacy gate, delivered/read fan-out to multiple
 devices, typing routing and expiry fields, block suppression, membership checks
 for typing, per-connection typing/read throttling, and duplicate sends not
-re-emitting status events.
+re-emitting status events. The phase-10 suites cover PNG/JPEG/GIF/WebP/PDF/TXT/
+CSV uploads, metadata and authenticated downloads, extension/signature/
+declared-MIME mismatches, empty/oversized files, the configurable per-request
+count, unsafe filenames, non-member and uploader-only access, deletion and
+missing objects, cleanup when a database commit fails, text-plus-media and
+media-only messages, attachment to an existing message, cross-conversation/
+foreign/fake media, block-aware attachment, idempotent WS sends with matching
+text and media, and the `message_updated` broadcast.
 
 Email is never really sent during tests: the transport is replaced with an
 in-memory capture (`tests/conftest.py`), while token creation, hashing, storage,
@@ -967,6 +1168,12 @@ variables or the local `.env` file. See `.env.example` for every supported key:
 | `CONVERSATION_MAX_LIMIT` | `50`          | Hard ceiling for one conversation page.        |
 | `MESSAGE_MAX_LIMIT` | `100`             | Hard ceiling for one message page.             |
 | `CHAT_RATE_LIMIT_ATTEMPTS` / `_WINDOW_SECONDS` | `120` / `60` | Chat budget per account. |
+| `MEDIA_STORAGE_BACKEND` | `local`          | Media backend (only `local` in this phase). |
+| `MEDIA_STORAGE_PATH` | `var/media`         | Local storage root, outside the app package. |
+| `MEDIA_MAX_UPLOAD_BYTES` | `10485760`      | Per-file upload ceiling (10 MiB). |
+| `MEDIA_MAX_FILES_PER_REQUEST` | `4`         | Files accepted in one multipart upload. |
+| `MEDIA_MAX_IMAGE_DIMENSION` | `20000`       | Maximum image width/height read from the header. |
+| `MEDIA_RATE_LIMIT_ATTEMPTS` / `_WINDOW_SECONDS` | `60` / `60` | Media budget per account. |
 | `WS_AUTH_TIMEOUT_SECONDS` | `5`        | Seconds allowed for the first `auth` frame.    |
 | `WS_HEARTBEAT_INTERVAL_SECONDS` | `30` | Server `ping` interval.                       |
 | `WS_IDLE_TIMEOUT_SECONDS` | `90`        | Disconnect a client that sends nothing for this long. |
@@ -996,10 +1203,10 @@ Unexpected failures are normalised to a consistent JSON envelope:
 
 ## Roadmap
 
-Groups, file storage and E2EE are planned for later stages, and realtime
-fan-out needs a shared pub/sub store to run in more than one process. When the
-service scales horizontally, move the rate limiters, the token denylist and the
-connection registry to a shared store (for example Redis).
+Groups, shared object storage (MinIO/S3), and E2EE are planned for later
+stages, and realtime fan-out needs a shared pub/sub store to run in more than one
+process. When the service scales horizontally, move the rate limiters, the token
+denylist and the connection registry to a shared store (for example Redis).
 
 ### Known limitations in this phase
 
@@ -1037,8 +1244,24 @@ connection registry to a shared store (for example Redis).
   per-device receipt and no push of missed messages on reconnect (the client
   fetches history and marks read). "Read" is a watermark the client chooses
   (`last_message_id`), not a per-message acknowledgement. Typing indicators are
-  in-process and ephemeral. Edits, deletions and attachments are still out of
-  scope.
+  in-process and ephemeral. Message edits and deletions are still out of scope;
+  media attachments are supported and described above.
+* **Media storage is local-disk and single-node.** `LocalStorage` writes under
+  `MEDIA_STORAGE_PATH` on the machine running the API. There is no replication,
+  shared volume, lifecycle policy or backup integration; a second worker sees the
+  same directory only if the deployment mounts it there. MinIO/S3 is the planned
+  backend, but no such service is added in this phase. The database/file write is
+  not a distributed transaction: a crash can leave an orphan file, and there is
+  no periodic sweeper yet.
+* **Media processing is deliberately minimal.** Files are type-checked by
+  extension, declared MIME and magic bytes, and images are bounded by header
+  dimensions; they are **not decoded**, scanned for malware, stripped of EXIF or
+  transcoded. There are no thumbnails, previews, resumable uploads or `Range`
+  downloads. PDFs and other files are always served as attachments, never inline.
+* **One attachment per message, and no detach.** The unique `media.message_id`
+  makes this a database rule. Attached media cannot be deleted (it is message
+  history); only unattached uploads can be removed. A richer attachment model
+  (multiple files, captions, detach) would need a join table and a new contract.
 * **Last-seen granularity is per process.** It is written on authentication
   (throttled by `LAST_SEEN_UPDATE_INTERVAL_SECONDS`) and when the last local
   socket closes; with multiple workers another worker's open socket is invisible,

@@ -1,0 +1,229 @@
+"""add media storage and optional message bodies
+
+Revision ID: 0007_add_media
+Revises: 0006_message_statuses
+Create Date: 2026-10-24
+
+Adds conversation-scoped media metadata and makes ``messages.body`` nullable so
+a message can carry text, media, or both. The binary is **not** stored in the
+database; only the opaque storage key and safe metadata are.
+
+SQLite cannot alter a column's nullability or replace a CHECK constraint in
+place, so this migration rebuilds ``messages`` (copying every row) on SQLite.
+The rebuild preserves the primary key, foreign keys, all CHECK constraints,
+and the four indexes. ``media`` is created *after* the rebuild, so no foreign
+key points at the table while it is being swapped. On other databases the
+equivalent ``ALTER TABLE`` operations are used.
+
+Rollback note: downgrading drops the ``media`` table (and its metadata). If any
+media-only message exists (``body IS NULL``), the downgrade refuses instead of
+silently deleting messages or inventing placeholder text. Remove/attach text to
+those messages first, or restore from a backup.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+import sqlalchemy as sa
+from alembic import op
+
+# revision identifiers, used by Alembic.
+revision: str = "0007_add_media"
+down_revision: str | None = "0006_message_statuses"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
+
+_MESSAGE_MAX_LENGTH = 4000
+
+
+def _rebuild_messages(*, nullable_body: bool) -> None:
+    """Rebuild the messages table on SQLite, preserving all rows and rules."""
+    body_type = "VARCHAR(4000)" + ("" if nullable_body else " NOT NULL")
+    if nullable_body:
+        not_blank = "body IS NULL OR length(trim(body)) > 0"
+        too_long = f"body IS NULL OR length(body) <= {_MESSAGE_MAX_LENGTH}"
+    else:
+        not_blank = "length(trim(body)) > 0"
+        too_long = f"length(body) <= {_MESSAGE_MAX_LENGTH}"
+
+    op.execute(
+        f"""
+        CREATE TABLE messages_phase10 (
+            id INTEGER NOT NULL,
+            conversation_id INTEGER NOT NULL,
+            sender_id INTEGER NOT NULL,
+            body {body_type},
+            client_message_id VARCHAR(64),
+            created_at DATETIME DEFAULT (CURRENT_TIMESTAMP) NOT NULL,
+            delivered_at DATETIME,
+            read_at DATETIME,
+            CONSTRAINT pk_messages PRIMARY KEY (id),
+            CONSTRAINT ck_messages_body_not_blank CHECK ({not_blank}),
+            CONSTRAINT ck_messages_body_too_long CHECK ({too_long}),
+            CONSTRAINT fk_messages_conversation_id_conversations FOREIGN KEY(conversation_id) REFERENCES conversations (id) ON DELETE CASCADE,
+            CONSTRAINT fk_messages_sender_id_users FOREIGN KEY(sender_id) REFERENCES users (id) ON DELETE CASCADE
+        )
+        """
+    )
+    op.execute(
+        """
+        INSERT INTO messages_phase10
+            (id, conversation_id, sender_id, body, client_message_id,
+             created_at, delivered_at, read_at)
+        SELECT id, conversation_id, sender_id, body, client_message_id,
+               created_at, delivered_at, read_at
+        FROM messages
+        """
+    )
+    op.execute("DROP TABLE messages")
+    op.execute("ALTER TABLE messages_phase10 RENAME TO messages")
+
+    op.create_index(
+        op.f("ix_messages_conversation_id"), "messages", ["conversation_id"]
+    )
+    op.create_index(op.f("ix_messages_sender_id"), "messages", ["sender_id"])
+    op.create_index(
+        "ix_messages_conversation_id_id", "messages", ["conversation_id", "id"]
+    )
+    op.create_index(
+        "uq_messages_conversation_sender_client",
+        "messages",
+        ["conversation_id", "sender_id", "client_message_id"],
+        unique=True,
+    )
+
+
+def upgrade() -> None:
+    dialect = op.get_bind().dialect.name
+    if dialect == "sqlite":
+        _rebuild_messages(nullable_body=True)
+    else:
+        op.drop_constraint("ck_messages_body_not_blank", "messages", type_="check")
+        op.drop_constraint("ck_messages_body_too_long", "messages", type_="check")
+        op.alter_column(
+            "messages",
+            "body",
+            existing_type=sa.String(length=_MESSAGE_MAX_LENGTH),
+            nullable=True,
+        )
+        op.create_check_constraint(
+            "ck_messages_body_not_blank",
+            "messages",
+            "body IS NULL OR length(trim(body)) > 0",
+        )
+        op.create_check_constraint(
+            "ck_messages_body_too_long",
+            "messages",
+            f"body IS NULL OR length(body) <= {_MESSAGE_MAX_LENGTH}",
+        )
+
+    op.create_table(
+        "media",
+        sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
+        sa.Column("public_id", sa.String(length=32), nullable=False),
+        sa.Column("storage_key", sa.String(length=128), nullable=False),
+        sa.Column("original_filename", sa.String(length=255), nullable=False),
+        sa.Column("content_type", sa.String(length=100), nullable=False),
+        sa.Column("size_bytes", sa.Integer(), nullable=False),
+        sa.Column("width", sa.Integer(), nullable=True),
+        sa.Column("height", sa.Integer(), nullable=True),
+        sa.Column(
+            "status",
+            sa.String(length=20),
+            server_default="ready",
+            nullable=False,
+        ),
+        sa.Column("conversation_id", sa.Integer(), nullable=False),
+        sa.Column("uploader_id", sa.Integer(), nullable=False),
+        sa.Column("message_id", sa.Integer(), nullable=True),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+        sa.CheckConstraint("size_bytes > 0", name=op.f("ck_media_size_positive")),
+        sa.CheckConstraint(
+            "(width IS NULL AND height IS NULL) OR "
+            "(width IS NOT NULL AND height IS NOT NULL AND width > 0 AND height > 0)",
+            name=op.f("ck_media_dimensions_valid"),
+        ),
+        sa.CheckConstraint(
+            "status IN ('pending', 'ready', 'failed')",
+            name=op.f("ck_media_status_allowed"),
+        ),
+        sa.ForeignKeyConstraint(
+            ["conversation_id"],
+            ["conversations.id"],
+            name=op.f("fk_media_conversation_id_conversations"),
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["uploader_id"],
+            ["users.id"],
+            name=op.f("fk_media_uploader_id_users"),
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["message_id"],
+            ["messages.id"],
+            name=op.f("fk_media_message_id_messages"),
+            ondelete="SET NULL",
+        ),
+        sa.PrimaryKeyConstraint("id", name=op.f("pk_media")),
+        sa.UniqueConstraint("public_id", name="uq_media_public_id"),
+        sa.UniqueConstraint("storage_key", name="uq_media_storage_key"),
+        sa.UniqueConstraint("message_id", name="uq_media_message_id"),
+    )
+    op.create_index(
+        "ix_media_conversation_id_created_at",
+        "media",
+        ["conversation_id", "created_at"],
+    )
+    op.create_index(
+        op.f("ix_media_uploader_id"), "media", ["uploader_id"], unique=False
+    )
+
+
+def downgrade() -> None:
+    # Check before dropping anything: a refusal must leave both the media table
+    # and the message rows untouched, even on a backend with non-transactional
+    # DDL.
+    null_bodies = op.get_bind().execute(
+        sa.text("SELECT COUNT(*) FROM messages WHERE body IS NULL")
+    ).scalar_one()
+    if null_bodies:
+        raise RuntimeError(
+            "Cannot downgrade 0007 while media-only messages exist; "
+            "add text to them or restore a backup."
+        )
+
+    op.drop_index(op.f("ix_media_uploader_id"), table_name="media")
+    op.drop_index(
+        "ix_media_conversation_id_created_at", table_name="media"
+    )
+    op.drop_table("media")
+
+    dialect = op.get_bind().dialect.name
+    if dialect == "sqlite":
+        _rebuild_messages(nullable_body=False)
+    else:
+        op.drop_constraint("ck_messages_body_not_blank", "messages", type_="check")
+        op.drop_constraint("ck_messages_body_too_long", "messages", type_="check")
+        op.alter_column(
+            "messages",
+            "body",
+            existing_type=sa.String(length=_MESSAGE_MAX_LENGTH),
+            nullable=False,
+        )
+        op.create_check_constraint(
+            "ck_messages_body_not_blank",
+            "messages",
+            "length(trim(body)) > 0",
+        )
+        op.create_check_constraint(
+            "ck_messages_body_too_long",
+            "messages",
+            f"length(body) <= {_MESSAGE_MAX_LENGTH}",
+        )
