@@ -22,12 +22,14 @@ from app.core.security import (
 
 SECRET = "unit-test-secret-0123456789abcdefghijklmnopqrstuvwxyz"
 STRONG_PASSWORD = "Str0ng-Passw0rd!"
+DATABASE_URL = "postgresql+psycopg://test:test@127.0.0.1:5432/test"
 
 
 @pytest.fixture()
 def settings() -> Settings:
     return Settings(
         app_env="test",
+        database_url=DATABASE_URL,
         jwt_secret_key=SECRET,
         access_token_expire_minutes=15,
     )
@@ -117,7 +119,11 @@ def test_tampered_token_is_rejected(settings: Settings) -> None:
 
 
 def test_token_signed_with_another_secret_is_rejected(settings: Settings) -> None:
-    other = Settings(app_env="test", jwt_secret_key="a-completely-different-secret-value-123456")
+    other = Settings(
+        app_env="test",
+        database_url=DATABASE_URL,
+        jwt_secret_key="a-completely-different-secret-value-123456",
+    )
     token, _ = create_access_token(1, settings=other)
 
     with pytest.raises(TokenError):
@@ -127,6 +133,7 @@ def test_token_signed_with_another_secret_is_rejected(settings: Settings) -> Non
 def test_token_with_wrong_audience_is_rejected(settings: Settings) -> None:
     other = Settings(
         app_env="test",
+        database_url=DATABASE_URL,
         jwt_secret_key=SECRET,
         jwt_audience="someone-else",
     )
@@ -151,9 +158,18 @@ def test_alg_none_token_is_rejected(settings: Settings) -> None:
 
 def test_algorithm_allowlist_rejects_unsafe_configuration() -> None:
     with pytest.raises(ValueError):
-        Settings(app_env="test", jwt_secret_key=SECRET, jwt_algorithm="none")
+        Settings(
+            app_env="test",
+            database_url=DATABASE_URL,
+            jwt_secret_key=SECRET,
+            jwt_algorithm="none",
+        )
 
 
 def test_secret_is_required_and_long_enough() -> None:
     with pytest.raises(ValueError):
-        Settings(app_env="test", jwt_secret_key="too-short")
+        Settings(
+            app_env="test",
+            database_url=DATABASE_URL,
+            jwt_secret_key="too-short",
+        )

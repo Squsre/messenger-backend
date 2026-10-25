@@ -35,9 +35,8 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    # ``ALTER TABLE ... ADD COLUMN`` and ``CREATE [UNIQUE] INDEX`` are both
-    # supported by SQLite and PostgreSQL, so no table rebuild (batch mode) is
-    # needed — which also keeps the existing CHECK constraints untouched.
+    # ``ALTER TABLE ... ADD COLUMN`` and ``CREATE [UNIQUE] INDEX`` preserve the
+    # existing CHECK constraints and indexes without a table rebuild.
     op.add_column(
         "messages",
         sa.Column("client_message_id", sa.String(length=64), nullable=True),

@@ -25,29 +25,29 @@ from fastapi import Request
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from app.core.config import Settings, get_settings
 
 
 def create_db_engine(url: str, *, echo: bool = False) -> Engine:
-    """Build a SQLAlchemy engine suitable for the given URL.
+    """Build a PostgreSQL engine for the given URL.
 
-    SQLite needs a couple of tweaks (``check_same_thread`` and, for in-memory
-    databases, a shared static pool). PostgreSQL uses SQLAlchemy's normal
-    connection pool; ``pool_pre_ping`` protects both backends from stale
-    connections. The only difference between environments is ``DATABASE_URL``.
+    PostgreSQL is the only supported backend. ``pool_pre_ping`` protects pooled
+    connections from stale sockets after database restarts or network errors.
     """
-    options: dict[str, object] = {"echo": echo, "pool_pre_ping": True, "future": True}
+    parsed = make_url(url)
+    if parsed.drivername != "postgresql+psycopg":
+        raise ValueError(
+            "Only PostgreSQL URLs using the psycopg driver are supported "
+            "(postgresql+psycopg://...)."
+        )
 
-    if url.startswith("sqlite"):
-        options["connect_args"] = {"check_same_thread": False}
-        if ":memory:" in url:
-            # A single shared connection keeps the in-memory schema visible to
-            # every session created from this engine.
-            options["poolclass"] = StaticPool
-
-    return create_engine(url, **options)
+    return create_engine(
+        url,
+        echo=echo,
+        pool_pre_ping=True,
+        future=True,
+    )
 
 
 def create_session_factory(engine: Engine) -> sessionmaker[Session]:

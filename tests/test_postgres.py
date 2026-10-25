@@ -1,22 +1,12 @@
-"""Optional PostgreSQL integration tests.
+"""PostgreSQL integration tests.
 
-The regular suite uses isolated SQLite files so it stays fast and needs no
-services. These tests exercise the same schema and migration history against a
-real PostgreSQL server when ``TEST_POSTGRES_URL`` is set::
-
-    $env:TEST_POSTGRES_URL = "postgresql+psycopg://messenger:test-password@127.0.0.1:5432/messenger_test"
-    .\\.venv\\Scripts\\python.exe -m pytest tests/test_postgres.py -v
-
-The URL must point at a disposable database. Every test creates a uniquely
-named PostgreSQL schema, puts it first on ``search_path`` and drops it again, so
-the database's ``public`` schema and existing data are never touched.
+The whole test suite runs against PostgreSQL. These tests additionally assert
+dialect-specific behaviour: real migrations from an empty schema, the widened
+Alembic version column, and PostgreSQL partial indexes/CHECK constraints.
 """
 
 from __future__ import annotations
 
-import os
-import uuid
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -24,11 +14,9 @@ from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
-from sqlalchemy import create_engine, inspect, select, text
-from sqlalchemy.engine import make_url
+from sqlalchemy import inspect, select, text
 from sqlalchemy.exc import IntegrityError
 
-from app.core.config import DatabaseSettings
 from app.db.base import Base
 from app.db.models import HealthCheck
 from app.db.session import Database, create_db_engine
@@ -36,47 +24,7 @@ from app.db.session import Database, create_db_engine
 # Importing the models registers them on Base.metadata.
 import app.db.models  # noqa: E402, F401
 
-_RAW_POSTGRES_URL = os.getenv("TEST_POSTGRES_URL", "").strip()
-# Accept postgres:// and postgresql:// shorthands just like the application.
-POSTGRES_URL = (
-    DatabaseSettings(database_url=_RAW_POSTGRES_URL).database_url
-    if _RAW_POSTGRES_URL
-    else ""
-)
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
-pytestmark = pytest.mark.skipif(
-    not POSTGRES_URL,
-    reason="set TEST_POSTGRES_URL to run PostgreSQL integration tests",
-)
-
-
-def _schema_url(base_url: str, schema: str) -> str:
-    """Return a URL whose connections use the test schema as ``search_path``."""
-    url = make_url(base_url)
-    query = dict(url.query)
-    query["options"] = f"-csearch_path={schema}"
-    return url.set(query=query).render_as_string(hide_password=False)
-
-
-@pytest.fixture()
-def postgres_schema() -> Iterator[tuple[str, str]]:
-    """Create a throw-away schema and yield ``(url, schema_name)``."""
-    if not POSTGRES_URL:  # pragma: no cover - the module-level skip is primary
-        pytest.skip("TEST_POSTGRES_URL is not set")
-
-    schema = f"messenger_test_{uuid.uuid4().hex[:12]}"
-    admin_engine = create_engine(POSTGRES_URL, pool_pre_ping=True)
-    try:
-        with admin_engine.begin() as connection:
-            connection.execute(text(f'CREATE SCHEMA "{schema}"'))
-        yield _schema_url(POSTGRES_URL, schema), schema
-    finally:
-        # The tests dispose their engines before teardown. DROP ... CASCADE is
-        # safe because the schema name is generated here and never user input.
-        with admin_engine.begin() as connection:
-            connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
-        admin_engine.dispose()
 
 
 def _alembic_config(db_url: str) -> Config:
@@ -88,11 +36,8 @@ def _alembic_config(db_url: str) -> Config:
     return config
 
 
-def test_postgres_connection_create_tables_and_crud(
-    postgres_schema: tuple[str, str],
-) -> None:
-    url, _ = postgres_schema
-    database = Database(url)
+def test_postgres_connection_create_tables_and_crud(db_url: str) -> None:
+    database = Database(db_url)
     try:
         with database.engine.connect() as connection:
             assert connection.dialect.name == "postgresql"
@@ -125,15 +70,12 @@ def test_postgres_connection_create_tables_and_crud(
         database.dispose()
 
 
-def test_postgres_migrations_from_empty_to_head_and_back(
-    postgres_schema: tuple[str, str],
-) -> None:
-    url, _ = postgres_schema
-    config = _alembic_config(url)
+def test_postgres_migrations_from_empty_to_head_and_back(db_url: str) -> None:
+    config = _alembic_config(db_url)
 
     command.upgrade(config, "head")
 
-    engine = create_db_engine(url)
+    engine = create_db_engine(db_url)
     try:
         inspector = inspect(engine)
         assert {
@@ -180,21 +122,18 @@ def test_postgres_migrations_from_empty_to_head_and_back(
 
     command.downgrade(config, "base")
 
-    engine = create_db_engine(url)
+    engine = create_db_engine(db_url)
     try:
         assert set(inspect(engine).get_table_names()) <= {"alembic_version"}
     finally:
         engine.dispose()
 
 
-def test_postgres_group_invariants_and_partial_unique_index(
-    postgres_schema: tuple[str, str],
-) -> None:
-    url, _ = postgres_schema
-    config = _alembic_config(url)
+def test_postgres_group_invariants_and_partial_unique_index(db_url: str) -> None:
+    config = _alembic_config(db_url)
     command.upgrade(config, "head")
 
-    engine = create_db_engine(url)
+    engine = create_db_engine(db_url)
     try:
         with engine.begin() as connection:
             for email, username in (

@@ -1,4 +1,4 @@
-"""Tests that exercise the real Alembic migrations against a temporary database."""
+"""Tests that exercise the real Alembic migrations against PostgreSQL."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
 from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DataError, IntegrityError
 
 from app.db.base import Base
 from app.db.session import create_db_engine
@@ -30,19 +30,22 @@ _USERNAME_PATTERN = re.compile(r"^[a-z0-9_]{3,32}$")
 
 _INSERT_LEGACY_USER = text(
     "INSERT INTO users (email, hashed_password, is_active) "
-    "VALUES (:email, :hashed_password, 1)"
+    "VALUES (:email, :hashed_password, TRUE)"
 )
 
 
 @pytest.fixture()
-def migration_url(tmp_path) -> str:
-    return f"sqlite:///{(tmp_path / 'migrations.db').as_posix()}"
+def migration_url(db_url: str) -> str:
+    """Use the test's isolated PostgreSQL schema for real migrations."""
+    return db_url
 
 
 def _alembic_config(db_url: str) -> Config:
     config = Config(str(PROJECT_ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(PROJECT_ROOT / "migrations"))
-    config.set_main_option("sqlalchemy.url", db_url)
+    # ConfigParser uses ``%`` for interpolation. The schema URL contains a
+    # percent-encoded search_path, so escape it for the ini layer.
+    config.set_main_option("sqlalchemy.url", db_url.replace("%", "%%"))
     return config
 
 
@@ -308,7 +311,7 @@ def test_email_uniqueness_is_enforced_by_the_database(migration_url: str) -> Non
     try:
         insert = text(
             "INSERT INTO users (email, username, hashed_password, is_active) "
-            "VALUES (:email, :username, :hashed_password, 1)"
+            "VALUES (:email, :username, :hashed_password, TRUE)"
         )
         with engine.begin() as connection:
             connection.execute(
@@ -341,7 +344,7 @@ def test_username_uniqueness_is_enforced_by_the_database(migration_url: str) -> 
     try:
         insert = text(
             "INSERT INTO users (email, username, hashed_password, is_active) "
-            "VALUES (:email, :username, :hashed_password, 1)"
+            "VALUES (:email, :username, :hashed_password, TRUE)"
         )
         with engine.begin() as connection:
             connection.execute(
@@ -380,7 +383,7 @@ def test_self_contacts_and_self_blocks_are_rejected_by_the_database(migration_ur
             connection.execute(
                 text(
                     "INSERT INTO users (email, username, hashed_password, is_active) "
-                    "VALUES ('solo@example.com', 'solo', 'h', 1)"
+                    "VALUES ('solo@example.com', 'solo', 'h', TRUE)"
                 )
             )
             user_id = connection.execute(text("SELECT id FROM users")).scalar_one()
@@ -534,9 +537,9 @@ def test_downgrade_two_steps_removes_groups_and_media(
             message_columns
         )
 
-        # The rebuild must preserve the foreign keys and indexes, not just the
-        # columns. This is the regression that a naive SQLite batch migration
-        # would silently lose.
+        # The downgrade must preserve the foreign keys and indexes, not just the
+        # columns. This is the regression that a table rebuild would silently
+        # lose.
         foreign_keys = {
             constraint["name"]
             for constraint in inspector.get_foreign_keys("messages")
@@ -683,7 +686,7 @@ def test_status_migration_preserves_existing_messages(migration_url: str) -> Non
                 connection.execute(
                     text(
                         "INSERT INTO users (email, username, hashed_password, is_active) "
-                        "VALUES (:email, :username, 'not-a-real-hash', 1)"
+                        "VALUES (:email, :username, 'not-a-real-hash', TRUE)"
                     ),
                     {"email": email, "username": username},
                 )
@@ -765,7 +768,7 @@ def test_chat_constraints_are_enforced_by_the_database(migration_url: str) -> No
                 connection.execute(
                     text(
                         "INSERT INTO users (email, username, hashed_password, is_active) "
-                        "VALUES (:email, :username, 'not-a-real-hash', 1)"
+                        "VALUES (:email, :username, 'not-a-real-hash', TRUE)"
                     ),
                     {"email": email, "username": username},
                 )
@@ -824,9 +827,10 @@ def test_chat_constraints_are_enforced_by_the_database(migration_url: str) -> No
                     )
                 )
 
-        # Blank and oversized bodies are refused by CHECK constraints.
+        # Blank bodies hit the CHECK constraint; oversized bodies are rejected
+        # by PostgreSQL's VARCHAR(4000) length before the CHECK is evaluated.
         for body in ("   ", "x" * 4001):
-            with pytest.raises(IntegrityError):
+            with pytest.raises((IntegrityError, DataError)):
                 with engine.begin() as connection:
                     connection.execute(
                         text(
@@ -853,7 +857,7 @@ def test_media_constraints_are_enforced_by_the_database(migration_url: str) -> N
                 connection.execute(
                     text(
                         "INSERT INTO users (email, username, hashed_password, is_active) "
-                        "VALUES (:email, :username, 'not-a-real-hash', 1)"
+                        "VALUES (:email, :username, 'not-a-real-hash', TRUE)"
                     ),
                     {"email": email, "username": username},
                 )
@@ -929,7 +933,7 @@ def test_downgrade_refuses_to_drop_media_only_messages(migration_url: str) -> No
             connection.execute(
                 text(
                     "INSERT INTO users (email, username, hashed_password, is_active) "
-                    "VALUES ('alice@example.com', 'alice', 'h', 1)"
+                    "VALUES ('alice@example.com', 'alice', 'h', TRUE)"
                 )
             )
             connection.execute(text("INSERT INTO conversations (pair_key) VALUES ('1:1')"))
@@ -962,7 +966,7 @@ def test_group_schema_and_constraints_are_enforced_by_the_database(
                 connection.execute(
                     text(
                         "INSERT INTO users (email, username, hashed_password, is_active) "
-                        "VALUES (:email, :username, 'h', 1)"
+                        "VALUES (:email, :username, 'h', TRUE)"
                     ),
                     {"email": email, "username": username},
                 )
@@ -1058,7 +1062,7 @@ def test_group_upgrade_preserves_existing_direct_rows(migration_url: str) -> Non
                 connection.execute(
                     text(
                         "INSERT INTO users (email, username, hashed_password, is_active) "
-                        "VALUES (:email, :username, 'h', 1)"
+                        "VALUES (:email, :username, 'h', TRUE)"
                     ),
                     {"email": email, "username": username},
                 )
@@ -1129,7 +1133,7 @@ def test_downgrade_refuses_to_delete_existing_groups(migration_url: str) -> None
             connection.execute(
                 text(
                     "INSERT INTO users (email, username, hashed_password, is_active) "
-                    "VALUES ('alice@example.com', 'alice', 'h', 1)"
+                    "VALUES ('alice@example.com', 'alice', 'h', TRUE)"
                 )
             )
             connection.execute(

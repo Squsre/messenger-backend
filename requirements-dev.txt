@@ -2,3 +2,6 @@
 
 pytest==8.3.4
 httpx==0.28.1
+# Read .env directly in tests/conftest.py (also a transitive dependency of
+# pydantic-settings, but declared explicitly for the test suite).
+python-dotenv==1.2.4

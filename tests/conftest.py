@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import os
 import re
+import uuid
+from collections.abc import Iterator
+from pathlib import Path
+
+from dotenv import dotenv_values
 
 # The JWT signing key is environment-only (no usable default in Settings), and
 # ``import app.main`` builds the app eagerly. Provide a test key before that
@@ -11,12 +16,12 @@ import re
 TEST_JWT_SECRET = "test-secret-key-0123456789abcdefghijklmnopqrstuvwxyz"
 os.environ.setdefault("JWT_SECRET_KEY", TEST_JWT_SECRET)
 
-from collections.abc import Iterator  # noqa: E402
-
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
+from sqlalchemy import create_engine, text  # noqa: E402
+from sqlalchemy.engine import make_url  # noqa: E402
 
-from app.core.config import Settings, get_settings  # noqa: E402
+from app.core.config import DatabaseSettings, Settings, get_settings  # noqa: E402
 from app.db.base import Base  # noqa: E402
 from app.db.session import Database  # noqa: E402
 from app.main import create_app  # noqa: E402
@@ -25,11 +30,82 @@ from app.services.email import EmailMessage  # noqa: E402
 # Importing the models registers every table on Base.metadata.
 import app.db.models  # noqa: E402, F401
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_ENV_VALUES = dotenv_values(PROJECT_ROOT / ".env")
+
 REGISTER_URL = "/api/v1/auth/register"
 LOGIN_URL = "/api/v1/auth/login"
 
 #: Satisfies the documented password policy.
 STRONG_PASSWORD = "Str0ng-Passw0rd!"
+
+
+def _configured_database_url(name: str) -> str:
+    """Read a PostgreSQL URL from the process environment or the local .env."""
+    value = os.getenv(name) or _ENV_VALUES.get(name, "")
+    if not value:
+        raise pytest.UsageError(
+            f"{name} is required. Point it at a disposable PostgreSQL database "
+            "(for example messenger_test) before running the test suite."
+        )
+    return DatabaseSettings(database_url=value).database_url
+
+
+TEST_DATABASE_URL = _configured_database_url("TEST_DATABASE_URL")
+_APP_DATABASE_URL = _configured_database_url("DATABASE_URL")
+
+
+def _same_server_database(left: str, right: str) -> bool:
+    left_url = make_url(left)
+    right_url = make_url(right)
+    return (
+        left_url.host == right_url.host
+        and left_url.port == right_url.port
+        and left_url.database == right_url.database
+    )
+
+
+if _same_server_database(TEST_DATABASE_URL, _APP_DATABASE_URL):
+    raise pytest.UsageError(
+        "TEST_DATABASE_URL must point at a separate database from DATABASE_URL; "
+        "the test suite creates and drops schemas and must not touch development data."
+    )
+
+
+def _ensure_test_database(url: str) -> None:
+    """Create the disposable test database when it does not exist yet.
+
+    The test database is created next to the development database, but is a
+    separate database. Every test then runs in its own short-lived schema, so no
+    table in the development database is ever touched.
+    """
+    parsed = make_url(url)
+    if parsed.drivername != "postgresql+psycopg":
+        raise pytest.UsageError(
+            "TEST_DATABASE_URL must use postgresql+psycopg://..."
+        )
+    database = parsed.database
+    if not database or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", database):
+        raise pytest.UsageError(
+            "TEST_DATABASE_URL must contain a simple PostgreSQL database name"
+        )
+
+    admin_engine = create_engine(
+        parsed.set(database="postgres", query={}),
+        isolation_level="AUTOCOMMIT",
+        pool_pre_ping=True,
+    )
+    try:
+        with admin_engine.connect() as connection:
+            exists = connection.execute(
+                text("SELECT 1 FROM pg_database WHERE datname = :name"),
+                {"name": database},
+            ).scalar_one_or_none()
+            if exists is None:
+                # The identifier was validated above and is never user input.
+                connection.execute(text(f'CREATE DATABASE "{database}"'))
+    finally:
+        admin_engine.dispose()
 
 
 class CapturingEmailService:
@@ -114,20 +190,46 @@ class ApiHelper:
         return response.json()
 
 
+@pytest.fixture(scope="session")
+def test_database_url() -> str:
+    """Ensure the disposable PostgreSQL test database exists."""
+    _ensure_test_database(TEST_DATABASE_URL)
+    return TEST_DATABASE_URL
+
+
 @pytest.fixture()
-def db_url(tmp_path) -> str:
-    """Path to an isolated, throw-away SQLite database for a single test."""
-    return f"sqlite:///{(tmp_path / 'test.db').as_posix()}"
+def db_url(test_database_url: str) -> Iterator[str]:
+    """Create an isolated PostgreSQL schema for a single test.
+
+    The schema is put first on ``search_path`` for the test application's
+    connections. It is dropped after the test, so tests cannot see each other's
+    rows and the development database is never touched.
+    """
+    schema = f"test_{uuid.uuid4().hex}"
+    admin_engine = create_engine(test_database_url, pool_pre_ping=True)
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+
+        parsed = make_url(test_database_url)
+        query = dict(parsed.query)
+        query["options"] = f"-csearch_path={schema}"
+        url = parsed.set(query=query).render_as_string(hide_password=False)
+        yield url
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        admin_engine.dispose()
 
 
 @pytest.fixture()
 def test_settings(db_url: str, tmp_path) -> Settings:
     """Deterministic settings used by the test-suite.
 
-    The database URL points at a temporary file so tests never touch the real
-    ``messenger.db`` and always start from a clean state. The login limiter is
-    left enabled but with a generous budget; the rate-limit tests build their own
-    app with tight limits.
+    The database URL points at a throw-away PostgreSQL schema so tests never
+    touch development data and always start from a clean state. The login
+    limiter is left enabled but with a generous budget; the rate-limit tests
+    build their own app with tight limits.
 
     Email delivery is ``disabled`` so a test can never write an outbox file into
     the repository; tests that need the message swap in
@@ -158,14 +260,14 @@ def test_settings(db_url: str, tmp_path) -> Settings:
 def app(test_settings: Settings):
     """A freshly built application instance bound to the test settings.
 
-    The full schema is created on the temporary database so tests exercise real
-    queries without paying for a migration run in every test (the migrations
-    themselves are verified separately in ``tests/test_migrations.py``).
+    The full schema is created in the test's isolated PostgreSQL schema so tests
+    exercise real queries without paying for a migration run in every test (the
+    migrations themselves are verified separately in ``tests/test_migrations.py``).
     """
     application = create_app(settings=test_settings)
     Base.metadata.create_all(bind=application.state.database.engine)
     yield application
-    # Release any open connections so Windows can delete the temp directory.
+    # Release pooled connections before the schema is dropped.
     application.state.database.dispose()
 
 

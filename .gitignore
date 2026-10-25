@@ -56,8 +56,6 @@ cover/
 # Django stuff:
 *.log
 local_settings.py
-db.sqlite3
-db.sqlite3-journal
 
 # Flask stuff:
 instance/
@@ -106,11 +104,6 @@ venv/
 ENV/
 env.bak/
 venv.bak/
-
-# Databases (local SQLite files)
-*.db
-*.sqlite
-*.sqlite3
 
 # Spyder project settings
 .spyderproject

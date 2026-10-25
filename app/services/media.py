@@ -1,7 +1,7 @@
 """Persistence and authorization rules for uploaded media.
 
 A media row is always scoped to **one conversation and one uploader**. The
-binary lives in the storage backend, never in SQLite/PostgreSQL. A row may be
+binary lives in the storage backend, never in PostgreSQL. A row may be
 attached to at most one message (``media.message_id`` is unique), which is what
 makes "one attachment per message" a database guarantee rather than a UI
 convention.

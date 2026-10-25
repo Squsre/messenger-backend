@@ -22,8 +22,8 @@ treat them as monotonic.
 client. A partial-style unique index over ``(conversation_id, sender_id,
 client_message_id)`` makes a retry after a dropped connection return the message
 that was already stored instead of creating a second one. Rows without a key
-store ``NULL``; both SQLite and PostgreSQL allow any number of ``NULL`` entries
-in a unique index, so ordinary sends are unaffected.
+store ``NULL``; PostgreSQL allows any number of ``NULL`` entries in a unique
+index, so ordinary sends are unaffected.
 
 The body is validated twice on purpose: by the request schema (a friendly
 ``422``) and by CHECK constraints here, so an empty or oversized row cannot be

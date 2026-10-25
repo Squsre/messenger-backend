@@ -33,8 +33,8 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    # ``ALTER TABLE ... ADD COLUMN`` works on SQLite and PostgreSQL, so the
-    # existing CHECK constraints and indexes are preserved without a rebuild.
+    # ``ALTER TABLE ... ADD COLUMN`` preserves the existing CHECK constraints
+    # and indexes without a rebuild.
     op.add_column(
         "messages",
         sa.Column("delivered_at", sa.DateTime(timezone=True), nullable=True),

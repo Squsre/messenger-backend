@@ -205,7 +205,7 @@ def _search_conditions(query: str, *, viewer_id: int) -> list:
     Excludes the viewer, deactivated accounts, users who opted out of discovery
     (``profile_visibility = private``), and anyone on either side of a block.
     The username filter is a range scan so the unique index on ``users.username``
-    is usable on SQLite *and* PostgreSQL.
+    is usable in PostgreSQL.
     """
     blocked_by_viewer = select(Block.blocked_id).where(Block.blocker_id == viewer_id)
     blocked_viewer = select(Block.blocker_id).where(Block.blocked_id == viewer_id)

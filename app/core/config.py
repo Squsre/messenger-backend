@@ -67,20 +67,18 @@ class DatabaseSettings(BaseSettings):
     )
 
     # --- Database ---
-    # PostgreSQL is the primary deployment database. SQLite remains the
-    # zero-setup fallback (and the default used by isolated tests) so importing
-    # settings never requires a running server. Set DATABASE_URL to a
-    # ``postgresql+psycopg://...`` URL in the environment or .env for PostgreSQL.
+    # PostgreSQL is the only supported database. The URL is required so the
+    # application can never silently fall back to a local file database.
     database_url: str = Field(
-        default="sqlite:///./messenger.db",
-        description="SQLAlchemy database URL (PostgreSQL or SQLite).",
+        ...,
+        description="PostgreSQL SQLAlchemy URL (postgresql+psycopg://...).",
     )
     db_echo: bool = Field(default=False, description="Log every SQL statement.")
 
     @field_validator("database_url")
     @classmethod
     def _normalise_database_url(cls, value: str) -> str:
-        """Reject an empty URL and accept common shorthand for PostgreSQL."""
+        """Require PostgreSQL and accept common URL shorthand."""
         url = value.strip()
         if not url:
             raise ValueError("database_url must not be empty")
@@ -90,6 +88,11 @@ class DatabaseSettings(BaseSettings):
             url = "postgresql+psycopg://" + url[len("postgres://") :]
         elif url.startswith("postgresql://"):
             url = "postgresql+psycopg://" + url[len("postgresql://") :]
+        if not url.startswith("postgresql+psycopg://"):
+            raise ValueError(
+                "database_url must use PostgreSQL with the psycopg driver "
+                "(postgresql+psycopg://...)"
+            )
         return url
 
 

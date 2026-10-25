@@ -276,10 +276,10 @@ def test_search_item_contains_only_public_fields(client, api) -> None:
         "created_at",
         "last_seen_at",
     }
-    # ``created_at`` is a real timestamp, not a placeholder. SQLite returns it
-    # without an offset, so compare against the UTC wall clock.
+    # ``created_at`` is a real timestamp, not a placeholder. PostgreSQL returns
+    # it with a UTC offset; normalise before comparing.
     parsed = datetime.fromisoformat(item["created_at"])
-    if parsed.tzinfo is not None:
-        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
     assert abs((now - parsed).total_seconds()) < 300

@@ -26,8 +26,8 @@ class ProfileVisibility(StrEnum):
     PRIVATE = "private"
 
 
-#: Stored as a plain string with a CHECK constraint (portable across SQLite and
-#: PostgreSQL, and avoids PostgreSQL-native ENUM type migrations).
+#: Stored as a plain string with a CHECK constraint (avoids PostgreSQL-native
+#: ENUM type migrations).
 PROFILE_VISIBILITY_VALUES: tuple[str, ...] = tuple(v.value for v in ProfileVisibility)
 
 _VISIBILITY_SQL_LIST = ", ".join(f"'{value}'" for value in PROFILE_VISIBILITY_VALUES)
@@ -40,8 +40,8 @@ class User(TimestampMixin, Base):
 
     Both ``email`` and ``username`` are stored already normalised (trimmed and
     lower-cased) by :mod:`app.services.user`, and each carries a unique index so
-    duplicates cannot be created even under a race, and so the uniqueness rule is
-    case-insensitive identically on SQLite and PostgreSQL.
+    duplicates cannot be created even under a race, and so the uniqueness rule
+    is case-insensitive in PostgreSQL.
     """
 
     __tablename__ = "users"

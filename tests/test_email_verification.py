@@ -273,7 +273,10 @@ def test_disabled_backend_still_issues_a_usable_token(client, api, db_session) -
 def test_default_settings_do_not_use_the_console_backend() -> None:
     from app.core.config import Settings
 
-    settings = Settings(jwt_secret_key="x" * 40)
+    settings = Settings(
+        database_url="postgresql+psycopg://test:test@127.0.0.1:5432/test",
+        jwt_secret_key="x" * 40,
+    )
     assert settings.email_backend in {"console", "smtp", "disabled"}
     assert settings.email_backend != "smtp"
 

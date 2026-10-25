@@ -18,9 +18,9 @@ two new tables the group layer needs:
   existing message timestamps remain the source of truth for direct chats.
 
 ``pair_key`` deliberately stays non-null and unique. Group rows use a random
-``group:<hex>`` value; this avoids a risky rebuild of the parent
-``conversations`` table while child foreign keys exist on SQLite, and cannot
-collide with the numeric direct-chat key.
+``group:<hex>`` value; this avoids rebuilding the parent ``conversations``
+table while child foreign keys exist, and cannot collide with the numeric
+direct-chat key.
 
 Downgrade note: if any group conversations exist, the downgrade refuses rather
 than silently deleting group messages and memberships. Remove the groups or
@@ -63,10 +63,10 @@ def upgrade() -> None:
         sa.Column("visibility", sa.String(length=16), nullable=True),
     )
     # Owner is the member whose membership role is ``owner``. The denormalised
-    # id is intentionally not a database FK: SQLite cannot add a *named* FK to an
-    # existing table via ALTER, and a full table rebuild would be unsafe while
-    # child foreign keys exist. The service enforces ownership consistency and
-    # there is no account-deletion endpoint that could orphan it.
+    # id is intentionally not a database FK: adding a named FK to an existing
+    # table would require a rebuild while child foreign keys exist. The service
+    # enforces ownership consistency and there is no account-deletion endpoint
+    # that could orphan it.
     op.add_column(
         "conversations",
         sa.Column("owner_id", sa.Integer(), nullable=True),
@@ -162,7 +162,6 @@ def upgrade() -> None:
         "group_invitations",
         ["conversation_id", "invitee_id"],
         unique=True,
-        sqlite_where=sa.text("status = 'pending'"),
         postgresql_where=sa.text("status = 'pending'"),
     )
 

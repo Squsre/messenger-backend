@@ -51,6 +51,14 @@ def test_postgres_url_shorthand_is_normalised(raw: str, expected: str) -> None:
     assert settings.database_url == expected
 
 
+def test_non_postgres_database_url_is_rejected() -> None:
+    with pytest.raises(ValueError, match="must use PostgreSQL"):
+        DatabaseSettings(database_url="sqlite:///./legacy.db")
+
+    with pytest.raises(ValueError, match="Only PostgreSQL"):
+        create_db_engine("sqlite:///./legacy.db")
+
+
 def test_safe_url_redacts_the_password() -> None:
     database = Database(
         "postgresql+psycopg://messenger:s3cret@127.0.0.1:5432/messenger"
@@ -96,7 +104,7 @@ def test_create_and_read_record(database: Database, schema: None) -> None:
 def test_session_rolls_back_on_error(database: Database, schema: None) -> None:
     with pytest.raises(RuntimeError):
         with database.session() as session:
-            session.add(HealthCheck(status="will_be_rolled_back", detail="boom"))
+            session.add(HealthCheck(status="rolled_back", detail="boom"))
             session.flush()
             raise RuntimeError("simulated failure")
 

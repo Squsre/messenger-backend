@@ -49,16 +49,11 @@ def _ensure_postgres_version_table(connection: sa.Connection) -> None:
 
     Alembic 1.14 creates ``alembic_version.version_num`` as ``VARCHAR(32)``.
     This project's revision ids are longer (for example
-    ``0002_create_users_and_token_blocklist`` is 38 characters). SQLite ignores
-    the length, but PostgreSQL rejects the update and the migration fails.
-
-    Pre-creating the tiny bookkeeping table with a wider column is safe: it is
-    not application data and it does not rewrite any migration. Existing
-    PostgreSQL databases created by an older attempt are widened in place.
+    ``0002_create_users_and_token_blocklist`` is 38 characters), so PostgreSQL
+    would reject the version update. Pre-creating the tiny bookkeeping table
+    with a wider column is safe: it is not application data and it does not
+    rewrite any migration. Existing databases are widened in place.
     """
-
-    if connection.dialect.name != "postgresql":
-        return
 
     with connection.begin():
         inspector = sa.inspect(connection)
@@ -96,9 +91,6 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
-        # Batch mode is a SQLite workaround; using it for PostgreSQL offline
-        # output would emit table-rebuild SQL that PostgreSQL does not need.
-        render_as_batch=url.startswith("sqlite"),
     )
 
     with context.begin_transaction():
@@ -123,8 +115,6 @@ def run_migrations_online() -> None:
             connection=connection,
             target_metadata=target_metadata,
             compare_type=True,
-            # SQLite cannot ALTER most things; batch mode rewrites tables safely.
-            render_as_batch=connection.dialect.name == "sqlite",
         )
 
         with context.begin_transaction():

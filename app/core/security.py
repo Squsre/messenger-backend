@@ -100,9 +100,9 @@ GROUP_DESCRIPTION_MAX_LENGTH = 280
 CLIENT_MESSAGE_ID_MAX_LENGTH = 64
 
 # Usernames are stored lower-cased and restricted to a portable character set.
-# Lower-casing at the boundary makes uniqueness case-insensitive identically on
-# SQLite and PostgreSQL, so a plain unique index is enough. The first character
-# must be alphanumeric so handles cannot look like internal markers (``_x``).
+# Lower-casing at the boundary makes uniqueness case-insensitive in PostgreSQL,
+# so a plain unique index is enough. The first character must be alphanumeric so
+# handles cannot look like internal markers (``_x``).
 USERNAME_PATTERN = re.compile(
     rf"^[a-z0-9][a-z0-9_]{{{USERNAME_MIN_LENGTH - 1},{USERNAME_MAX_LENGTH - 1}}}$"
 )

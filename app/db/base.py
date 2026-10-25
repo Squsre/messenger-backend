@@ -2,8 +2,7 @@
 
 Uses the SQLAlchemy 2.0 typed declarative style (``DeclarativeBase`` +
 ``Mapped`` / ``mapped_column``). A naming convention is configured so that
-constraint names are predictable, which keeps Alembic migrations stable when
-moving between SQLite and PostgreSQL.
+constraint names are predictable, which keeps Alembic migrations stable.
 """
 
 from __future__ import annotations

@@ -10,8 +10,8 @@ Direct conversations
 participants. The unique index on it is what makes "one conversation per pair"
 a **database** guarantee: two concurrent requests cannot create a duplicate,
 even if the application-level lookup races. Keeping it a plain string (instead
-of a composite unique index over the member table) also means the rule is
-expressible on SQLite and PostgreSQL identically.
+of a composite unique index over the member table) also keeps the rule simple
+to enforce in PostgreSQL.
 
 Group conversations
 -------------------
@@ -20,8 +20,8 @@ pipeline and one message model. A group row has ``kind='group'``, a name, a
 visibility and an owner. ``pair_key`` remains non-null (and unique) for groups,
 but it is a server-generated synthetic value with a ``group:`` prefix. It is
 never used for lookup and cannot collide with the numeric direct-chat key. This
-keeps the existing SQLite schema safe to extend without rebuilding the parent
-table (which would be unsafe while child foreign keys exist).
+keeps the existing schema safe to extend without rebuilding the parent table
+(which would be unsafe while child foreign keys exist).
 """
 
 from __future__ import annotations

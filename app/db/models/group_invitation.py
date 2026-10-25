@@ -59,15 +59,14 @@ class GroupInvitation(Base):
         ),
         Index("ix_group_invitations_invitee_status", "invitee_id", "status"),
         Index("ix_group_invitations_inviter_id", "inviter_id"),
-        # At most one *pending* invitation per group and invitee. Both SQLite
-        # and PostgreSQL support partial indexes; a plain unique constraint
-        # would incorrectly prevent re-inviting after a decline/revoke.
+        # At most one *pending* invitation per group and invitee. PostgreSQL
+        # partial indexes enforce this; a plain unique constraint would
+        # incorrectly prevent re-inviting after a decline/revoke.
         Index(
             "uq_group_invitations_pending",
             "conversation_id",
             "invitee_id",
             unique=True,
-            sqlite_where=text("status = 'pending'"),
             postgresql_where=text("status = 'pending'"),
         ),
     )

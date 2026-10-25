@@ -188,7 +188,7 @@ def list_conversations(
 
     ``coalesce`` keeps conversations that have no messages yet (``NULL``
     ``last_message_at``) ordered by their creation time instead of sorting them
-    unpredictably, and works on SQLite and PostgreSQL alike.
+    unpredictably.
     """
     statement = (
         _member_conversations(user_id)

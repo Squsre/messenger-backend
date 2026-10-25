@@ -8,12 +8,9 @@ Adds conversation-scoped media metadata and makes ``messages.body`` nullable so
 a message can carry text, media, or both. The binary is **not** stored in the
 database; only the opaque storage key and safe metadata are.
 
-SQLite cannot alter a column's nullability or replace a CHECK constraint in
-place, so this migration rebuilds ``messages`` (copying every row) on SQLite.
-The rebuild preserves the primary key, foreign keys, all CHECK constraints,
-and the four indexes. ``media`` is created *after* the rebuild, so no foreign
-key points at the table while it is being swapped. On other databases the
-equivalent ``ALTER TABLE`` operations are used.
+PostgreSQL supports altering nullability and replacing CHECK constraints in
+place, so this migration uses ordinary ``ALTER TABLE`` operations and preserves
+every existing row.
 
 Rollback note: downgrading drops the ``media`` table (and its metadata). If any
 media-only message exists (``body IS NULL``), the downgrade refuses instead of
@@ -37,93 +34,32 @@ depends_on: str | Sequence[str] | None = None
 _MESSAGE_MAX_LENGTH = 4000
 
 
-def _rebuild_messages(*, nullable_body: bool) -> None:
-    """Rebuild the messages table on SQLite, preserving all rows and rules."""
-    body_type = "VARCHAR(4000)" + ("" if nullable_body else " NOT NULL")
-    if nullable_body:
-        not_blank = "body IS NULL OR length(trim(body)) > 0"
-        too_long = f"body IS NULL OR length(body) <= {_MESSAGE_MAX_LENGTH}"
-    else:
-        not_blank = "length(trim(body)) > 0"
-        too_long = f"length(body) <= {_MESSAGE_MAX_LENGTH}"
-
-    op.execute(
-        f"""
-        CREATE TABLE messages_phase10 (
-            id INTEGER NOT NULL,
-            conversation_id INTEGER NOT NULL,
-            sender_id INTEGER NOT NULL,
-            body {body_type},
-            client_message_id VARCHAR(64),
-            created_at DATETIME DEFAULT (CURRENT_TIMESTAMP) NOT NULL,
-            delivered_at DATETIME,
-            read_at DATETIME,
-            CONSTRAINT pk_messages PRIMARY KEY (id),
-            CONSTRAINT ck_messages_body_not_blank CHECK ({not_blank}),
-            CONSTRAINT ck_messages_body_too_long CHECK ({too_long}),
-            CONSTRAINT fk_messages_conversation_id_conversations FOREIGN KEY(conversation_id) REFERENCES conversations (id) ON DELETE CASCADE,
-            CONSTRAINT fk_messages_sender_id_users FOREIGN KEY(sender_id) REFERENCES users (id) ON DELETE CASCADE
-        )
-        """
-    )
-    op.execute(
-        """
-        INSERT INTO messages_phase10
-            (id, conversation_id, sender_id, body, client_message_id,
-             created_at, delivered_at, read_at)
-        SELECT id, conversation_id, sender_id, body, client_message_id,
-               created_at, delivered_at, read_at
-        FROM messages
-        """
-    )
-    op.execute("DROP TABLE messages")
-    op.execute("ALTER TABLE messages_phase10 RENAME TO messages")
-
-    op.create_index(
-        op.f("ix_messages_conversation_id"), "messages", ["conversation_id"]
-    )
-    op.create_index(op.f("ix_messages_sender_id"), "messages", ["sender_id"])
-    op.create_index(
-        "ix_messages_conversation_id_id", "messages", ["conversation_id", "id"]
-    )
-    op.create_index(
-        "uq_messages_conversation_sender_client",
-        "messages",
-        ["conversation_id", "sender_id", "client_message_id"],
-        unique=True,
-    )
-
-
 def upgrade() -> None:
-    dialect = op.get_bind().dialect.name
-    if dialect == "sqlite":
-        _rebuild_messages(nullable_body=True)
-    else:
-        # ``op.f`` marks these as final names. Without it Alembic applies the
-        # ``ck_%(table_name)s_%(constraint_name)s`` naming convention a second
-        # time and PostgreSQL looks for ``ck_messages_ck_messages_...``.
-        op.drop_constraint(
-            op.f("ck_messages_body_not_blank"), "messages", type_="check"
-        )
-        op.drop_constraint(
-            op.f("ck_messages_body_too_long"), "messages", type_="check"
-        )
-        op.alter_column(
-            "messages",
-            "body",
-            existing_type=sa.String(length=_MESSAGE_MAX_LENGTH),
-            nullable=True,
-        )
-        op.create_check_constraint(
-            op.f("ck_messages_body_not_blank"),
-            "messages",
-            "body IS NULL OR length(trim(body)) > 0",
-        )
-        op.create_check_constraint(
-            op.f("ck_messages_body_too_long"),
-            "messages",
-            f"body IS NULL OR length(body) <= {_MESSAGE_MAX_LENGTH}",
-        )
+    # ``op.f`` marks these as final names. Without it Alembic applies the
+    # ``ck_%(table_name)s_%(constraint_name)s`` naming convention a second
+    # time and PostgreSQL looks for ``ck_messages_ck_messages_...``.
+    op.drop_constraint(
+        op.f("ck_messages_body_not_blank"), "messages", type_="check"
+    )
+    op.drop_constraint(
+        op.f("ck_messages_body_too_long"), "messages", type_="check"
+    )
+    op.alter_column(
+        "messages",
+        "body",
+        existing_type=sa.String(length=_MESSAGE_MAX_LENGTH),
+        nullable=True,
+    )
+    op.create_check_constraint(
+        op.f("ck_messages_body_not_blank"),
+        "messages",
+        "body IS NULL OR length(trim(body)) > 0",
+    )
+    op.create_check_constraint(
+        op.f("ck_messages_body_too_long"),
+        "messages",
+        f"body IS NULL OR length(body) <= {_MESSAGE_MAX_LENGTH}",
+    )
 
     op.create_table(
         "media",
@@ -212,29 +148,25 @@ def downgrade() -> None:
     )
     op.drop_table("media")
 
-    dialect = op.get_bind().dialect.name
-    if dialect == "sqlite":
-        _rebuild_messages(nullable_body=False)
-    else:
-        op.drop_constraint(
-            op.f("ck_messages_body_not_blank"), "messages", type_="check"
-        )
-        op.drop_constraint(
-            op.f("ck_messages_body_too_long"), "messages", type_="check"
-        )
-        op.alter_column(
-            "messages",
-            "body",
-            existing_type=sa.String(length=_MESSAGE_MAX_LENGTH),
-            nullable=False,
-        )
-        op.create_check_constraint(
-            op.f("ck_messages_body_not_blank"),
-            "messages",
-            "length(trim(body)) > 0",
-        )
-        op.create_check_constraint(
-            op.f("ck_messages_body_too_long"),
-            "messages",
-            f"length(body) <= {_MESSAGE_MAX_LENGTH}",
-        )
+    op.drop_constraint(
+        op.f("ck_messages_body_not_blank"), "messages", type_="check"
+    )
+    op.drop_constraint(
+        op.f("ck_messages_body_too_long"), "messages", type_="check"
+    )
+    op.alter_column(
+        "messages",
+        "body",
+        existing_type=sa.String(length=_MESSAGE_MAX_LENGTH),
+        nullable=False,
+    )
+    op.create_check_constraint(
+        op.f("ck_messages_body_not_blank"),
+        "messages",
+        "length(trim(body)) > 0",
+    )
+    op.create_check_constraint(
+        op.f("ck_messages_body_too_long"),
+        "messages",
+        f"length(body) <= {_MESSAGE_MAX_LENGTH}",
+    )

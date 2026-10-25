@@ -26,9 +26,9 @@ def utcnow() -> datetime:
 def as_aware(value: datetime | None) -> datetime | None:
     """Attach UTC to a naive datetime.
 
-    SQLite does not persist timezone offsets on ``DateTime(timezone=True)``
-    columns, so values read back can be naive; comparing them with an aware
-    ``now`` would raise. PostgreSQL keeps the offset, so this is a no-op there.
+    PostgreSQL returns timezone-aware values for ``DateTime(timezone=True)``
+    columns. This helper keeps older or externally supplied values safe to
+    compare with an aware ``now``.
     """
     if value is None:
         return None

@@ -1,7 +1,7 @@
 # Messenger — Backend API
 
 Backend for the messenger project, built with **Python 3.11**, **FastAPI** and
-**SQLAlchemy 2.0** (PostgreSQL primary; SQLite fallback for tests), with
+**SQLAlchemy 2.0** with **PostgreSQL** as the only supported database, plus
 **Alembic** for migrations and
 **Argon2id + JWT** authentication.
 
@@ -21,9 +21,9 @@ Backend for the messenger project, built with **Python 3.11**, **FastAPI** and
 > **Stage 11** — private/public groups, owner/admin/member roles, invitations,
 > member management, group messaging with per-member delivery/read receipts, and
 > membership-scoped WebSocket group events.
-> **Stage 12** — PostgreSQL as the primary database: `psycopg` driver, a
-> development `compose.yaml`, PostgreSQL-safe migrations, credential-redacted
-> logs, and opt-in PostgreSQL integration tests.
+> **Stage 12** — PostgreSQL as the only supported database: `psycopg` driver,
+> a development `compose.yaml`, PostgreSQL-only settings and migrations,
+> credential-redacted logs, and a test suite that runs entirely on PostgreSQL.
 >
 > E2EE is still to come. Two-factor authentication and contact *requests* are
 > deliberately deferred and documented in the roadmap. Files are stored locally
@@ -145,7 +145,7 @@ messenger/
 │   ├── test_groups.py          # groups, discovery, invitations, roles, membership
 │   ├── test_group_messages.py  # group messages, per-member receipts, media
 │   ├── test_group_realtime.py  # group event fan-out and WebSocket authorization
-│   └── test_postgres.py        # opt-in PostgreSQL connection/migration/constraint tests
+│   └── test_postgres.py        # PostgreSQL connection/migration/constraint tests
 ├── alembic.ini
 ├── compose.yaml               # PostgreSQL 16 development service (healthcheck + volume)
 ├── .env.example
@@ -162,29 +162,46 @@ messenger/
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements-dev.txt
-Copy-Item .env.example .env
 
-# Edit .env: set a real JWT_SECRET_KEY and a local POSTGRES_PASSWORD.
-# Then start PostgreSQL and create the schema:
+# Create .env only if it does not exist. If it already exists, complete it in
+# place instead of overwriting your local values.
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+
+# Edit .env: set a strong JWT_SECRET_KEY and a matching POSTGRES_PASSWORD.
+# The DATABASE_URL password must match POSTGRES_PASSWORD.
 docker compose up -d postgres
+
+# Wait until the container reports healthy:
+docker compose ps
+
+# Create/update the PostgreSQL schema:
 .\.venv\Scripts\alembic upgrade head
+
+# Run the API locally (the API container is intentionally out of scope here):
+.\.venv\Scripts\uvicorn app.main:app --reload
 ```
 
-The API itself is not containerized in this phase; run it locally with
-`uvicorn app.main:app --reload`. To use the zero-setup SQLite fallback instead,
-set `DATABASE_URL=sqlite:///./messenger.db` in `.env` and skip the compose
-step.
+Run the full test suite with:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest
+```
 
 ## Database
 
-PostgreSQL 16 is the primary development and deployment database.
-`DATABASE_URL` is the only application setting that selects the backend; the
-driver is the `psycopg` 3 binary package added to `requirements.txt`.
+PostgreSQL 16 is the **only** supported development and deployment database.
+`DATABASE_URL` is required and must use the `postgresql+psycopg://` driver from
+`requirements.txt`; SQLite URLs are rejected by the settings layer and the
+engine factory. There is no file-database fallback.
 
-SQLite remains fully supported as a zero-setup fallback and is what the
-independent test suite uses by default. The application default is still
-`sqlite:///./messenger.db` so importing settings never needs a running server;
-`.env.example` selects PostgreSQL explicitly.
+The test suite also runs on PostgreSQL, but uses a separate database named by
+`TEST_DATABASE_URL` (normally `messenger_test`). Each test creates and drops its
+own short-lived schema, so tests never touch the development database. The test
+database is created automatically if it does not exist.
+
+`POSTGRES_*` values initialize a new Docker volume. Changing them after the first
+startup does not update the existing role or database; update PostgreSQL
+manually after a backup, or deliberately use a new volume.
 
 ### Start PostgreSQL for development
 
@@ -241,10 +258,10 @@ settings layer. The real password belongs only in the Git-ignored `.env`;
 .\.venv\Scripts\alembic revision --autogenerate -m "describe change"
 ```
 
-The database URL is read from `DATABASE_URL` (via `.env`), so the same commands
-work for PostgreSQL and SQLite. Stage 12 adds no revision; the schema is still
-the phase-11 head, now verified from an empty PostgreSQL database through every
-upgrade and back down again.
+The database URL is read from `DATABASE_URL` (via `.env`) and must be a
+PostgreSQL URL. Stage 12 adds no revision; the schema is still the phase-11
+head, now verified from an empty PostgreSQL database through every upgrade and
+back down again.
 
 > PostgreSQL note: Alembic 1.14 hardcodes `alembic_version.version_num` as
 > `VARCHAR(32)`, but this project's revision ids are longer (for example
@@ -288,19 +305,18 @@ and no constraint or index is touched. `downgrade` removes only those two
 columns, never the messages.
 
 `0007` adds the `media` table and makes `messages.body` **nullable** so a
-message can be media-only. SQLite cannot change nullability or replace a CHECK
-constraint in place, so the migration rebuilds `messages` on SQLite while copying
-every row, primary key, foreign key, CHECK constraint and index. `media` is
-created after the rebuild, and the upgrade is safe on a populated database.
-Downgrading refuses if any `body IS NULL` row exists instead of deleting
-messages or inventing placeholder text; add text to those messages first or
-restore a backup.
+message can be media-only. PostgreSQL changes the column and replaces the CHECK
+constraints in place while preserving every row, primary key, foreign key and
+index. `media` is created after that change, and the upgrade is safe on a
+populated database. Downgrading refuses if any `body IS NULL` row exists
+instead of deleting messages or inventing placeholder text; add text to those
+messages first or restore a backup.
 
 `0008` reuses `conversations` and `messages` for groups. Existing rows are
 backfilled as `kind='direct'` and role `member`; no message is rewritten.
 `pair_key` stays non-null and unique, with a random `group:<hex>` value for group
-rows, so the parent table does not need a risky SQLite rebuild. The migration
-adds `group_invitations` (with a partial unique index for one pending invitation
+rows, so the parent table does not need a risky rebuild. The migration adds
+`group_invitations` (with a partial unique index for one pending invitation
 per group/invitee) and `message_receipts` (unique per message/member). The
 downgrade **refuses** while any group conversation exists instead of deleting
 group memberships, invitations, receipts or messages.
@@ -329,9 +345,9 @@ group memberships, invitations, receipts or messages.
 ```
 
 Expected: `current` reports `0008_add_groups (head)` and `check` reports
-`No new upgrade operations detected.` The optional PostgreSQL integration test
-(see [Run the tests](#run-the-tests)) repeats this against an isolated schema
-and compares the migrated schema with `Base.metadata`.
+`No new upgrade operations detected.` The PostgreSQL integration tests
+(see [Run the tests](#run-the-tests)) repeat this against isolated schemas and
+compare the migrated schema with `Base.metadata`.
 
 ### Session usage in future endpoints
 
@@ -358,22 +374,17 @@ with get_database().session() as session:
     session.add(SomeModel(...))
 ```
 
-### Switching between PostgreSQL and SQLite
+### PostgreSQL connection
 
-1. Set `DATABASE_URL` in `.env` to the desired backend.
-2. Run `alembic upgrade head`.
-3. Start the API with the same environment.
+`DATABASE_URL` is the only database selection setting. It must point at the
+same database, user, password and host port configured by the `POSTGRES_*`
+values used by Compose. The engine uses SQLAlchemy's normal pool with
+`pool_pre_ping=True`; startup logs print the URL with the password redacted.
 
-No application code changes are required: the engine factory only special-cases
-SQLite's connection arguments and in-memory pool. PostgreSQL uses SQLAlchemy's
-normal pool with `pool_pre_ping=True`. Startup logs print the URL with the
-password redacted.
-
-**Existing data:** running migrations creates an empty schema. This phase does
-not copy rows from an existing `messenger.db` into PostgreSQL, and it never
-deletes the SQLite file. Moving real data is a separate, explicitly approved
-operation (for example a reviewed `pgloader`/custom export-import after a
-backup); it is deliberately not run automatically.
+**Existing data:** migrations create the PostgreSQL schema from empty. This
+phase intentionally does not import data from the former local file database;
+that local file was removed as part of this phase. For a real deployment, take
+and verify backups before any schema change.
 
 ## Authentication
 
@@ -490,9 +501,8 @@ changed at any time through `PATCH /users/me`.
 letters/digits/underscores, must start with a letter or digit, and a reserved
 list (`me`, `search`, `admin`, route names, …) is refused so a handle can never
 collide with an endpoint. Usernames are stored lower-cased, which makes
-uniqueness case-insensitive *identically* on SQLite and PostgreSQL — a unique
-index on the column is the hard guarantee, the Python check is only a nicer
-error.
+uniqueness case-insensitive in PostgreSQL — a unique index on the column is the
+hard guarantee, the Python check is only a nicer error.
 
 **Two response shapes, never confused:**
 
@@ -655,9 +665,8 @@ token generation, hashing, expiry and single-use enforcement run for real).
 * results are **prefix** matches, with an exact match ranked first, then ordered
   by username; `limit` is clamped to `SEARCH_MAX_LIMIT` (default 50),
 * the prefix filter is compiled as `username >= 'ab' AND username < 'ab…'`
-  rather than `LIKE 'ab%'`, so the unique index on `users.username` is usable on
-  SQLite *and* PostgreSQL (a plain b-tree index cannot serve `LIKE` on
-  PostgreSQL),
+  rather than `LIKE 'ab%'`, so the unique index on `users.username` is usable in
+  PostgreSQL (a plain b-tree index cannot serve `LIKE`),
 * the caller, deactivated accounts and anyone on either side of a block are
   excluded, and `private` profiles are never listed,
 * results contain only public profile fields, and
@@ -1362,36 +1371,32 @@ Example health response:
 ## Run the tests
 
 ```powershell
-python -m pytest
+.\.venv\Scripts\python.exe -m pytest
 ```
 
-Tests never touch `messenger.db`: each one gets a temporary SQLite file. Media
-tests also point `MEDIA_STORAGE_PATH` at a per-test temporary directory, so the
-suite never reads or writes real user uploads.
+Tests run against PostgreSQL. Each test gets a unique short-lived schema in the
+database named by `TEST_DATABASE_URL` (normally `messenger_test`), which is
+dropped afterwards. The development database named by `DATABASE_URL` is never
+used by the suite. Media tests also point `MEDIA_STORAGE_PATH` at a per-test
+temporary directory, so the suite never reads or writes real user uploads.
 
-PostgreSQL integration tests are **opt-in** and skipped unless
-`TEST_POSTGRES_URL` is set:
+`TEST_DATABASE_URL` is required and must point at a **separate** disposable
+database; the test fixtures refuse to run if it matches `DATABASE_URL`. If the
+test database does not exist, the suite creates it automatically. The
+PostgreSQL integration tests in `tests/test_postgres.py` are part of the normal
+suite and are not skipped.
 
-```powershell
-$env:TEST_POSTGRES_URL = "postgresql+psycopg://messenger:test-password@127.0.0.1:5432/messenger_test"
-.\.venv\Scripts\python.exe -m pytest tests/test_postgres.py -v
-```
-
-Point it at a disposable database. Each test creates a uniquely named schema,
-puts it first on `search_path`, runs the real migrations/CRUD/constraints, and
-drops the schema; the `public` schema and existing data are untouched. The
-tests cover the psycopg connection, `Base.metadata.create_all`, a full
+The tests cover the psycopg connection, `Base.metadata.create_all`, a full
 `alembic upgrade head` from empty, `alembic check`-equivalent metadata
 comparison, downgrade to base, the pending-invitation partial unique index,
 CHECK constraints and the one-receipt-per-member rule.
 
-The migration tests run the real
-`alembic upgrade`/`downgrade` commands against a throw-away database and
-additionally assert that the migrated schema matches the ORM models (no drift);
-they also verify that the `0003` upgrade backfills a unique username for every
-pre-existing account and preserves existing rows, that `0004` upgrades and rolls
-back cleanly, that `0006` only adds nullable status
-columns (existing messages survive both directions), that `0007` rebuilds
+The migration tests run the real `alembic upgrade`/`downgrade` commands against
+a throw-away schema and additionally assert that the migrated schema matches
+the ORM models (no drift); they also verify that the `0003` upgrade backfills a
+unique username for every pre-existing account and preserves existing rows,
+that `0004` upgrades and rolls back cleanly, that `0006` only adds nullable
+status columns (existing messages survive both directions), that `0007` alters
 `messages` without losing rows/foreign keys/indexes and refuses a downgrade when
 media-only rows exist, and that earlier migrations are never rewritten.
 Authentication tests cover registration, login, token
@@ -1448,7 +1453,9 @@ variables or the local `.env` file. See `.env.example` for every supported key:
 | `API_V1_PREFIX`  | `/api/v1`             | Prefix for version 1 routes.                   |
 | `HOST` / `PORT`  | `127.0.0.1` / `8000`  | Suggested bind address.                        |
 | `CORS_ORIGINS`   | *(empty)*             | Comma-separated allowed origins.               |
-| `DATABASE_URL`   | `sqlite:///./messenger.db` (code fallback; `.env.example` uses PostgreSQL) | SQLAlchemy URL: `postgresql+psycopg://...` or `sqlite:///...`. |
+| `DATABASE_URL`   | *(required)*          | PostgreSQL URL: `postgresql+psycopg://...`; SQLite is rejected. |
+| `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_PORT` | *(compose values)* | PostgreSQL container settings; must match `DATABASE_URL`. |
+| `TEST_DATABASE_URL` | *(required for tests)* | Separate disposable PostgreSQL database for the test suite. |
 | `DB_ECHO`        | `false`               | Log every SQL statement.                       |
 | `JWT_SECRET_KEY` | *(required)*          | HMAC signing key. **No default** — the app will not start without it. |
 | `JWT_ALGORITHM`  | `HS256`               | `HS256` / `HS384` / `HS512` only.              |
@@ -1500,7 +1507,7 @@ variables or the local `.env` file. See `.env.example` for every supported key:
 
 `compose.yaml` also reads `POSTGRES_DB`, `POSTGRES_USER`,
 `POSTGRES_PASSWORD` and `POSTGRES_PORT` from `.env`; those four variables are
-consumed by Docker Compose, not directly by the API. `TEST_POSTGRES_URL` is a
+consumed by Docker Compose, not directly by the API. `TEST_DATABASE_URL` is a
 test-only environment variable and is not part of `Settings`.
 
 Generate a signing key with:
@@ -1522,22 +1529,21 @@ Unexpected failures are normalised to a consistent JSON envelope:
 Channels/broadcast lists, shared object storage (MinIO/S3), and E2EE are planned
 for later stages, and realtime fan-out needs a shared pub/sub store to run in
 more than one process. PostgreSQL operational hardening (backups, CI migration
-checks, a reviewed SQLite-to-PostgreSQL data import) and containerizing the API
-are follow-up work. When the service scales horizontally, move the rate
-limiters, the token denylist and the connection registry to a shared store (for
-example Redis).
+checks) and containerizing the API are follow-up work. When the service scales
+horizontally, move the rate limiters, the token denylist and the connection
+registry to a shared store (for example Redis).
 
 ### Known limitations in this phase
 
-* **PostgreSQL is supported as a single primary database, not a cluster.** The
-  compose service is for development: one PostgreSQL 16 container, one local
-  volume, and a healthcheck. There is no replication, failover, managed backup,
+* **PostgreSQL is a single primary database, not a cluster.** The compose
+  service is for development: one PostgreSQL 16 container, one local volume,
+  and a healthcheck. There is no replication, failover, managed backup,
   connection pooler or multi-node deployment recipe yet. The API itself is still
   run outside Docker in this phase.
-* **SQLite data is not copied automatically.** Migrations create the PostgreSQL
-  schema from empty; an existing `messenger.db` is left untouched. A reviewed
-  export/import (after a backup) is required before switching a database with
-  real rows, and has not been performed here.
+* **The PostgreSQL schema starts empty.** There is no automatic import from the
+  former local file database; this phase removed that file because its data was
+  not needed. For a real deployment, take and verify backups before any schema
+  change.
 * **Rate limiting is per process.** Each uvicorn worker (and each restarted
   process) keeps its own counters, so the effective budget multiplies with the
   worker count. It stops casual abuse, not a distributed attack; a shared store
@@ -1604,9 +1610,9 @@ example Redis).
   automatic ownership election. A group always has exactly one owner; if the
   owner account is disabled, an admin cannot take over without the owner
   transferring first (an operator would need to repair the row).
-* **The denormalised `conversations.owner_id` has no database FK.** SQLite cannot
-  add a named FK with `ALTER TABLE`, and rebuilding the parent table while child
-  FKs exist is unsafe. The `owner` membership role is the authorization source of
+* **The denormalised `conversations.owner_id` has no database FK.** Adding a
+  named FK would require rebuilding the parent table while child FKs exist. The
+  `owner` membership role is the authorization source of
   truth; the service keeps `owner_id` in sync on creation and transfer. There is
   no account-deletion endpoint that could orphan it in this phase.
 * **Group read counts include receipts from former members.** A member who read a

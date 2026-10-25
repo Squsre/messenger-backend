@@ -248,6 +248,7 @@ def test_me_with_token_signed_by_other_secret_is_unauthorized(client, db_session
 
     foreign_settings = Settings(
         app_env="test",
+        database_url="postgresql+psycopg://test:test@127.0.0.1:5432/test",
         jwt_secret_key="a-totally-different-secret-value-0123456789",
     )
     forged, _ = create_access_token(user.id, settings=foreign_settings)
