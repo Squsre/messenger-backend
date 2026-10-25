@@ -70,6 +70,14 @@ OPENAPI_TAGS = [
         ),
     },
     {
+        "name": "groups",
+        "description": (
+            "Private and public groups: ownership and admin roles, invitations, "
+            "membership, public discovery and group messages with per-member "
+            "delivery/read receipts. Group events use the same WebSocket."
+        ),
+    },
+    {
         "name": "media",
         "description": (
             "Authenticated upload, metadata, download, attachment and deletion of "

@@ -17,11 +17,13 @@ Inbound
 
 ``{"type": "read", "conversation_id": 1, "last_message_id": 42}``
     Mark incoming messages up to (and including) ``last_message_id`` as read.
-    Confirmed (and fanned out to the other participant) with a ``read`` event.
+    Confirmed (and fanned out to the other participant(s)) with a ``read`` event.
+    For a group, only the caller's per-member receipt is advanced.
 
 ``{"type": "typing", "conversation_id": 1, "is_typing": true}``
     Ephemeral typing state. It is **not persisted**: the server validates
-    membership and forwards it to the other participant's live connections.
+    membership and forwards it to the other participant's (or group members')
+    live connections.
 
 ``{"type": "ping"}``
     Liveness check; answered with ``pong``.
@@ -33,8 +35,10 @@ Inbound
 Outbound
 --------
 ``ready``, ``message``, ``message_updated``, ``ack``, ``delivered``, ``read``,
-``typing``, ``ping``, ``pong`` and ``error``. See the models below; the README
-has the same table plus examples.
+``typing``, ``ping``, ``pong`` and ``error``, plus the group lifecycle events
+(``group_created``, ``group_updated``, membership/role/owner changes and
+invitation events). See the models below; the README has the same table plus
+examples.
 """
 
 from __future__ import annotations
@@ -57,6 +61,11 @@ from app.core.security import (
     MESSAGE_MAX_LENGTH,
 )
 from app.schemas.chat import MessageRead
+from app.schemas.group import (
+    GroupInvitationRead,
+    GroupMemberRead,
+    GroupRead,
+)
 from app.schemas.user import UserPublic
 
 
@@ -251,6 +260,76 @@ class MessageUpdatedEvent(BaseModel):
 
     type: Literal["message_updated"] = "message_updated"
     message: MessageRead
+
+
+class GroupCreatedEvent(BaseModel):
+    """A group was created; sent to the owner."""
+
+    type: Literal["group_created"] = "group_created"
+    group: GroupRead
+
+
+class GroupUpdatedEvent(BaseModel):
+    """Group name, description or visibility changed."""
+
+    type: Literal["group_updated"] = "group_updated"
+    group: GroupRead
+
+
+class GroupMemberJoinedEvent(BaseModel):
+    """A member joined (directly or by accepting an invitation)."""
+
+    type: Literal["group_member_joined"] = "group_member_joined"
+    group_id: int
+    member: GroupMemberRead
+
+
+class GroupMemberLeftEvent(BaseModel):
+    """A member left the group voluntarily."""
+
+    type: Literal["group_member_left"] = "group_member_left"
+    group_id: int
+    member: GroupMemberRead
+
+
+class GroupMemberRemovedEvent(BaseModel):
+    """An owner/admin removed a member."""
+
+    type: Literal["group_member_removed"] = "group_member_removed"
+    group_id: int
+    member: GroupMemberRead
+    actor_username: str
+
+
+class GroupRoleUpdatedEvent(BaseModel):
+    """A member was promoted to admin or demoted to member."""
+
+    type: Literal["group_role_updated"] = "group_role_updated"
+    group_id: int
+    member: GroupMemberRead
+
+
+class GroupOwnerTransferredEvent(BaseModel):
+    """Ownership moved to another member; the previous owner became admin."""
+
+    type: Literal["group_owner_transferred"] = "group_owner_transferred"
+    group_id: int
+    owner: GroupMemberRead
+    previous_owner_username: str
+
+
+class GroupInvitationEvent(BaseModel):
+    """A new pending invitation was created."""
+
+    type: Literal["group_invitation"] = "group_invitation"
+    invitation: GroupInvitationRead
+
+
+class GroupInvitationUpdatedEvent(BaseModel):
+    """An invitation was accepted, declined or revoked."""
+
+    type: Literal["group_invitation_updated"] = "group_invitation_updated"
+    invitation: GroupInvitationRead
 
 
 class AckEvent(BaseModel):

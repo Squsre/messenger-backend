@@ -17,11 +17,14 @@ Backend for the messenger project, built with **Python 3.11**, **FastAPI** and
 > indicators and WebSocket-driven last seen.
 > **Stage 10** — authenticated photo/file upload, validated storage, controlled
 > download, deletion of unattached uploads, and media attachments on messages.
+> **Stage 11** — private/public groups, owner/admin/member roles, invitations,
+> member management, group messaging with per-member delivery/read receipts, and
+> membership-scoped WebSocket group events.
 >
-> Groups and E2EE are still to come. Two-factor authentication and contact
-> *requests* are deliberately deferred and documented in the roadmap. Files are
-> stored locally behind a `StorageService` interface; MinIO/S3 is a later
-> backend, not a requirement for this stage.
+> E2EE is still to come. Two-factor authentication and contact *requests* are
+> deliberately deferred and documented in the roadmap. Files are stored locally
+> behind a `StorageService` interface; MinIO/S3 is a later backend, not a
+> requirement for this stage.
 
 ## Project layout
 
@@ -47,9 +50,11 @@ messenger/
 │   │       ├── verification_token.py # hashed single-use email/reset tokens
 │   │       ├── contact.py       # one-directional contact relationships
 │   │       ├── block.py         # user-to-user blocks
-│   │       ├── conversation.py  # one-to-one conversations (unique pair_key)
-│   │       ├── conversation_member.py # participants
+│   │       ├── conversation.py  # direct + group conversations (kind, metadata, owner)
+│   │       ├── conversation_member.py # participants + group roles
+│   │       ├── group_invitation.py # pending/accepted/declined/revoked invites
 │   │       ├── message.py       # append-only messages + delivery/read status
+│   │       ├── message_receipt.py # per-member group delivery/read receipts
 │   │       └── media.py         # conversation-scoped upload metadata (no binaries)
 │   ├── services/
 │   │   ├── user.py              # registration, lookup, username derivation
@@ -62,6 +67,7 @@ messenger/
 │   │   ├── auth.py              # shared token -> user resolution (HTTP + WebSocket)
 │   │   ├── realtime.py          # in-process WebSocket connection registry
 │   │   ├── chat.py              # conversations, membership, messages, read watermarks
+│   │   ├── group.py             # groups, roles, invitations, receipts, discovery
 │   │   ├── storage.py           # StorageService interface + local-disk backend
 │   │   ├── media_validation.py  # filename/content sniffing and dimension parsing
 │   │   └── media.py             # media rows, authorization, upload/attach rules
@@ -77,6 +83,7 @@ messenger/
 │   │           ├── contacts.py  # /api/v1/contacts
 │   │           ├── blocks.py    # /api/v1/blocks
 │   │           ├── conversations.py # /api/v1/conversations
+│   │           ├── groups.py    # /api/v1/groups
 │   │           ├── media.py    # /api/v1/media + conversation uploads
 │   │           └── realtime.py  # WS   /api/v1/ws
 │   └── schemas/
@@ -86,6 +93,7 @@ messenger/
 │       ├── account.py           # verification, password and session models
 │       ├── contact.py           # username reference model
 │       ├── chat.py              # conversation/message request + response models
+│       ├── group.py             # group, member, invitation, group-message models
 │       ├── media.py             # media metadata + attach request models
 │       └── realtime.py          # WebSocket frame schemas + parser
 ├── migrations/                  # Alembic environment
@@ -98,7 +106,8 @@ messenger/
 │       ├── 0004_add_conversations_and_messages.py
 │       ├── 0005_add_message_client_id.py
 │       ├── 0006_add_message_statuses.py
-│       └── 0007_add_media.py
+│       ├── 0007_add_media.py
+│       └── 0008_add_groups.py
 ├── tests/
 │   ├── conftest.py              # fixtures + register/login and email helpers
 │   ├── test_app.py              # startup, docs, wiring
@@ -127,7 +136,11 @@ messenger/
 │   ├── test_realtime_status.py  # delivered/read events, typing indicators
 │   ├── _media.py               # tiny valid image/PDF/CSV upload helpers (not collected)
 │   ├── test_media.py           # upload validation, storage, auth, delete, cleanup
-│   └── test_media_messages.py  # send/attach media, history, WS, idempotency
+│   ├── test_media_messages.py  # send/attach media, history, WS, idempotency
+│   ├── _groups.py              # group endpoint helpers (not collected)
+│   ├── test_groups.py          # groups, discovery, invitations, roles, membership
+│   ├── test_group_messages.py  # group messages, per-member receipts, media
+│   └── test_group_realtime.py  # group event fan-out and WebSocket authorization
 ├── alembic.ini
 ├── .env.example
 ├── .gitignore
@@ -176,7 +189,7 @@ SQLite is used by default and lives at `./messenger.db` (configurable through
 The database URL is read from `DATABASE_URL` (via `.env`), so the same commands
 work unchanged after switching to PostgreSQL.
 
-Current head: **`0007_add_media`**. Apply it to an existing
+Current head: **`0008_add_groups`**. Apply it to an existing
 database (created by an earlier stage) with a single `alembic upgrade head`:
 
 | Revision | What it adds |
@@ -188,6 +201,7 @@ database (created by an earlier stage) with a single `alembic upgrade head`:
 | `0005_message_client_id` | `messages.client_message_id` plus the unique index that makes realtime retries idempotent. |
 | `0006_message_statuses` | `messages.delivered_at` and `messages.read_at` (recipient delivery/read timestamps). |
 | `0007_add_media` | `media` (conversation-scoped upload metadata) and a nullable `messages.body` so a message can be media-only. |
+| `0008_add_groups` | Group columns on `conversations` (`kind`, `name`, `description`, `visibility`, `owner_id`), `conversation_members.role`, `group_invitations`, and `message_receipts`. |
 
 `0003` is written to be safe on a database that already contains accounts:
 `users.username` is added **nullable**, every existing account is backfilled
@@ -218,13 +232,23 @@ Downgrading refuses if any `body IS NULL` row exists instead of deleting
 messages or inventing placeholder text; add text to those messages first or
 restore a backup.
 
-> **Rollback warning:** from `0007`, `alembic downgrade -1` drops `media` and
+`0008` reuses `conversations` and `messages` for groups. Existing rows are
+backfilled as `kind='direct'` and role `member`; no message is rewritten.
+`pair_key` stays non-null and unique, with a random `group:<hex>` value for group
+rows, so the parent table does not need a risky SQLite rebuild. The migration
+adds `group_invitations` (with a partial unique index for one pending invitation
+per group/invitee) and `message_receipts` (unique per message/member). The
+downgrade **refuses** while any group conversation exists instead of deleting
+group memberships, invitations, receipts or messages.
+
+> **Rollback warning:** from `0008`, `alembic downgrade -1` removes the group
+> schema only when no group conversations exist; `-2` then drops `media` and
 > restores `messages.body NOT NULL` (refusing if media-only messages exist);
-> `-2` additionally removes the status timestamps; `-3` removes the idempotency
-> key. `-4` drops the three chat tables *and the messages they hold*; `-5` drops
-> the profile, verification and session columns *and their data*. All of these
-> are exercised by the test suite, but do not run them on a production database
-> that has real data without a backup.
+> `-3` removes the status timestamps; `-4` removes the idempotency key. `-5`
+> drops the three chat tables *and the messages they hold*; `-6` drops the
+> profile, verification and session columns *and their data*. All of these are
+> exercised by the test suite, but do not run them on a production database that
+> has real data without a backup.
 
 
 ### Session usage in future endpoints
@@ -830,15 +854,175 @@ unchanged. No S3/MinIO service is added in this phase.
 * `POST /media/{id}/attach` with `{"message_id": 42}` attaches an owned,
   unattached file to a message **the caller sent in the same conversation**.
   Attaching twice, or attaching to a message that already has media, is `409`.
-  The block rules are re-checked: a blocked pair gets `403` and the upload stays
-  unattached. The change is broadcast to both participants as `message_updated`
-  after the commit.
+  The block rules are re-checked for direct chats: a blocked pair gets `403` and
+  the upload stays unattached. The change is broadcast to every conversation
+  member as `message_updated` after the commit.
 * Media routes share the `media` per-user rate limiter
   (`MEDIA_RATE_LIMIT_ATTEMPTS` / `MEDIA_RATE_LIMIT_WINDOW_SECONDS`, default
   60/60 s). Errors use the normal envelope: `400` bad filename/empty/too many
   files, `401` auth, `403` non-uploader delete or blocked attach, `404`
   hidden/missing, `409` conflict, `413` too large, `415` unsupported type, `429`
   rate limit.
+
+## Groups
+
+Stage 11 adds private and public groups without introducing a second chat
+pipeline. A group is still a `conversations` row, its members are still
+`conversation_members` rows, and its messages are still `messages` rows. Direct
+chat response shapes are unchanged; group routes use their own response models
+because delivery/read state is per member rather than per message.
+
+### Roles, visibility and ownership
+
+| Role | Can do |
+| ---- | ------ |
+| `owner` | Edit all group fields, change visibility, invite, remove admins/members, change roles, transfer ownership. Cannot leave or be removed while owning the group. |
+| `admin` | Edit name/description, invite, remove ordinary members. Cannot remove another admin or the owner, change roles, or change visibility. |
+| `member` | Read/send messages, view the member list, leave. |
+
+* **Private** is the default. A private group never appears in search; a
+  non-member gets `404` for its profile, member list and messages. Joining
+  requires a valid invitation.
+* **Public** groups appear in `GET /groups/search` and may be joined directly.
+  Their profile and member list are visible to authenticated users, but reading
+  or sending messages still requires membership.
+* The owner is always a member with the `owner` role. Ownership is transferred
+  with a dedicated endpoint; the old owner becomes an `admin`. This is what keeps
+  a group from being left without an owner.
+* Roles and user ids in request bodies are never trusted. The service reloads
+  the caller's membership row and checks the role server-side.
+* Blocks prevent invitations (and a blocked account joining a public group owned
+  by the blocker). They do not retroactively remove an existing group member or
+  suppress a multi-party group message.
+
+### Endpoints
+
+| Method | Path | Purpose |
+| ------ | ---- | ------- |
+| `POST` | `/api/v1/groups` | Create a group; the caller becomes owner. |
+| `GET` | `/api/v1/groups` | Page through my groups, newest activity first. |
+| `GET` | `/api/v1/groups/search?q=…` | Search public group names/descriptions. |
+| `GET` | `/api/v1/groups/{id}` | Group profile (private: members only). |
+| `PATCH` | `/api/v1/groups/{id}` | Edit name/description (manager); visibility (owner). |
+| `GET` | `/api/v1/groups/{id}/members` | Paged member list, owner/admins first. |
+| `POST` | `/api/v1/groups/{id}/join` | Join a public group; repeat is `200`. |
+| `POST` | `/api/v1/groups/{id}/invitations` | Invite by `username` or `user_id`. |
+| `GET` | `/api/v1/groups/{id}/invitations` | Manager invitation list. |
+| `GET` | `/api/v1/groups/invitations` | My invitations; optional `status`. |
+| `POST` | `/api/v1/groups/{id}/invitations/{invitation_id}/accept` | Accept my invitation. |
+| `POST` | `/api/v1/groups/{id}/invitations/{invitation_id}/decline` | Decline my invitation. |
+| `POST` | `/api/v1/groups/{id}/invitations/{invitation_id}/revoke` | Revoke a pending invitation (manager). |
+| `DELETE` | `/api/v1/groups/{id}/invitations/{invitation_id}` | DELETE alias for revoke. |
+| `DELETE` | `/api/v1/groups/{id}/members/{user_id}` | Remove a member (manager). |
+| `PATCH` | `/api/v1/groups/{id}/members/{user_id}` | Change role to `admin`/`member` (owner). |
+| `POST` | `/api/v1/groups/{id}/transfer-owner` | Transfer ownership to a current member (owner). |
+| `POST` | `/api/v1/groups/{id}/leave` | Leave; the owner must transfer first. |
+| `POST` | `/api/v1/groups/{id}/messages` | Send a group message. |
+| `GET` | `/api/v1/groups/{id}/messages` | Group message history (members only). |
+| `POST` | `/api/v1/groups/{id}/read` | Advance my per-member read watermark. |
+
+Group creation returns `201`; the first join returns `201` and a repeated join
+returns `200`. Remove/leave/revoke-by-DELETE return `204`. A private group the
+caller cannot see, a missing member, or a missing invitation all return `404`
+rather than confirming existence. Invalid role changes, duplicate memberships,
+non-pending invitation transitions and an owner trying to leave return `409` or
+`403` according to the role/state rule.
+
+### Creating, listing and searching
+
+`POST /groups` accepts `{"name": "...", "description": "...", "visibility":
+"private"|"public"}`. Names are trimmed, must be 1–64 characters and cannot
+contain control characters; descriptions are optional up to 280 characters.
+Responses include `owner_username`, `member_count`, `is_member`, the caller's
+`role`, `unread_count`, and (for members) a newest-message preview.
+
+`GET /groups/search` only returns public groups. Search terms are trimmed and
+must meet the configured `SEARCH_MIN_QUERY_LENGTH` (default 2); `%` and `_` are
+escaped, so a term is matched literally. Private group rows are filtered in SQL,
+not hidden only in the response builder.
+
+### Invitations
+
+Invitations are scoped to one group and one invitee and move through
+`pending` → `accepted` / `declined` / `revoked`. Only a pending invitation can be
+accepted, declined or revoked. A partial unique index permits at most one
+*pending* invitation per `(group, invitee)`, so re-inviting is possible after a
+decline or revoke. Accepting twice after membership is idempotent; accepting
+another account's invitation returns `404`.
+
+Only the invitee may accept or decline. Owners and admins may invite, list and
+revoke. Self-invites, existing members, blocked accounts and inactive accounts
+are rejected. The invitee receives a `group_invitation` WebSocket event; the
+inviter/owner receive status updates.
+
+### Group messages and per-member receipts
+
+Group messages use the existing message validation (text 1–4000 characters,
+optional media uploaded by the sender in the same conversation, one attachment
+per message). Media routes work for groups because membership is checked against
+the shared conversation table; the direct-chat block check is skipped for group
+attachments.
+
+The direct chat model stores one `delivered_at`/`read_at` pair per message because
+there is one recipient. That would be wrong for a group: one member reading must
+not mark the message read for everyone. Group messages therefore use
+`message_receipts`, one row per `(message, member)`, and the group message
+response exposes:
+
+* `read_count` / `delivered_count` — other members who have read/received it;
+* `member_count` — total members, including the sender;
+* `read_by_me` / `delivered_to_me` — the caller's own receipt state (always true
+  for the caller's own messages);
+* `delivered_at` / `read_at` — retained for client compatibility but `null` for
+  groups; use the counts/flags instead.
+
+`POST /groups/{id}/read` with `{"last_message_id": 42}` advances only the
+caller's watermark, marks every incoming message up to that id delivered/read,
+and returns the same `ReadReceipt` shape as direct chat. Unread counts on the
+group list are computed from this table, not from the message columns.
+
+### Group realtime events
+
+Group events use the existing authenticated WebSocket. Message fan-out still
+uses the normal `message` event; only current members receive it. Read frames for
+a group update `message_receipts` and fan a normal `read` event out to the group's
+members. Typing is forwarded to the other members.
+
+Additional event types are:
+
+`group_created`, `group_updated`, `group_member_joined`, `group_member_left`,
+`group_member_removed`, `group_role_updated`, `group_owner_transferred`,
+`group_invitation`, `group_invitation_updated`.
+
+The audience is always read from `conversation_members` at broadcast time. A
+removed/left member stops receiving group events immediately; a non-member never
+receives a group message, typing or read event. Invitation events go only to the
+invitee and the inviter/owner, because the invitee is not a member yet.
+
+### Manual Swagger walkthrough
+
+1. Register and log in as `alice`, `bob` and `carol`; use **Authorize** with
+   Alice's access token.
+2. `POST /api/v1/groups` with a private group; note the returned `id`.
+3. `POST /api/v1/groups/{id}/invitations` with `{"username": "bob"}`.
+4. Authorize as Bob, `GET /api/v1/groups/invitations`, then
+   `POST /api/v1/groups/{id}/invitations/{invitation_id}/accept`.
+5. As Bob, `POST /api/v1/groups/{id}/messages`; as Alice, read
+   `GET /api/v1/groups/{id}/messages` and `GET /api/v1/groups`.
+6. As Bob, `POST /api/v1/groups/{id}/read`; re-read the history as Alice and
+   check `read_count` changed for Bob only.
+7. As Alice, `PATCH /api/v1/groups/{id}/members/{bob_user_id}` with
+   `{"role": "admin"}`, then `POST /api/v1/groups/{id}/transfer-owner` with
+   `{"username": "bob"}`. Alice can now `POST /leave`; Bob cannot until he
+   transfers ownership.
+8. Create a public group, search it as Carol, `POST /join`, and send a message.
+9. Negative checks: as Carol, a private group's detail/members/messages return
+   `404`; an ordinary member (not owner/admin) inviting someone returns `403`;
+   a duplicate pending invite returns `409`; the owner's `POST /leave` returns
+   `409`.
+10. WebSocket authorization needs a real socket (Swagger cannot send frames):
+    connect two accounts to `/api/v1/ws`, join the same group, and verify only
+    members receive `message`, `read`, `typing` and group event types.
 
 ## Realtime chat (WebSocket)
 
@@ -909,16 +1093,29 @@ Client → server:
 { "type": "pong" }
 ```
 
+Group events use the same envelope and are sent only to the members authorized
+at broadcast time:
+
+```json
+{ "type": "group_created", "group": { "id": 4, "name": "Hikers", "visibility": "private", "owner_username": "alice", "member_count": 1, "role": "owner" } }
+{ "type": "group_member_joined", "group_id": 4, "member": { "user_id": 2, "username": "bob", "role": "member" } }
+{ "type": "group_role_updated", "group_id": 4, "member": { "user_id": 2, "username": "bob", "role": "admin" } }
+{ "type": "group_owner_transferred", "group_id": 4, "owner": { "user_id": 2, "username": "bob", "role": "owner" }, "previous_owner_username": "alice" }
+{ "type": "group_invitation", "invitation": { "id": 9, "group_id": 4, "group_name": "Hikers", "status": "pending" } }
+```
+
 The `delivered` and `read` events carry a **watermark**: every message up to and
 including `message_id` has that status. Clients can apply them with a single
-update instead of tracking per-message rows. The `read` event is sent to both
-participants' connections (the initiating socket can treat it as the
+update instead of tracking per-message rows. In a direct chat the `read` event is
+sent to both participants' connections (the initiating socket can treat it as the
 acknowledgement of its `read` frame), while `delivered` goes only to the sender's
-devices. `message_updated` is emitted after media is attached to an existing
-message; clients should replace the message with the same `id` rather than append
-it. `typing` is forwarded only to the other participant and is **never stored**;
-`is_typing: false` clears it, and `expires_in_seconds` lets a client hide a stale
-indicator even if the stop frame is lost.
+devices. For a group, `read` is sent to every current member and refers to the
+initiating member's own receipt; there is no group-wide `delivered` event because
+delivery is per member. `message_updated` is emitted after media is attached to an
+existing message; clients should replace the message with the same `id` rather
+than append it. `typing` is forwarded to the other participant(s) and is **never
+stored**; `is_typing: false` clears it, and `expires_in_seconds` lets a client hide
+a stale indicator even if the stop frame is lost.
 
 `typing` frames are throttled per connection (`WS_TYPING_MIN_INTERVAL_SECONDS`,
 default 1 s); a stop frame is never throttled. Read frames have their own
@@ -955,28 +1152,33 @@ token into a response or a log line.
 * Sending goes through the same service as `POST …/messages`: optional text
   (1–4000 characters when present), optional `media_id` owned by the sender in
   the same conversation, membership check (non-members get `not_found`, never
-  "forbidden") and the phase-6 block rules (a blocked pair gets `forbidden` and
-  nothing is stored). The block check runs before any idempotent replay, so a
-  blocked retry cannot return a success-shaped `ack`.
+  "forbidden") and, for direct chats, the phase-6 block rules (a blocked pair gets
+  `forbidden` and nothing is stored). Group messages are multi-party, so a
+  pairwise block does not suppress them; blocks are enforced when inviting or
+  joining a public group. For direct chats the block check runs before any
+  idempotent replay, so a blocked retry cannot return a success-shaped `ack`.
 * An event is delivered only to connections whose accounts are members of that
-  conversation, read from the database at send time — there is no "subscribe"
+  conversation, read from the database at send time - there is no "subscribe"
   frame, so a client cannot widen its audience. The initiating socket gets the
-  `ack`; the other member's devices and the sender's other devices get
+  `ack`; the other members' devices and the sender's other devices get
   `message`.
-* The row is committed before the `ack`/fan-out. If the recipient is offline the
+* The row is committed before the `ack`/fan-out. If a recipient is offline the
   message simply waits in the history endpoint.
-* **Delivery and read state.** When a message is pushed to a live recipient
-  socket, `delivered_at` is stored in the same transaction and the sender's other
-  devices get a `delivered` event (the sending socket's `ack` already carries the
-  timestamp). `read` frames persist the watermark and are fanned out to both
-  sides; they are also accepted over HTTP. Reading sets `delivered_at` when it was
-  still missing, so a message that arrives while the recipient is offline goes
-  straight from "sent" to "read".
+* **Delivery and read state.** In a direct chat, when a message is pushed to a
+  live recipient socket, `delivered_at` is stored in the same transaction and the
+  sender's other devices get a `delivered` event (the sending socket's `ack`
+  already carries the timestamp). In a group, a `message_receipts` row is written
+  for each connected recipient instead; the group HTTP history exposes counts.
+  `read` frames persist the caller's watermark and are fanned out to the
+  conversation's members; they are also accepted over HTTP. Reading sets
+  `delivered_at` when it was still missing, so a message that arrives while the
+  recipient is offline goes straight from "sent" to "read".
 * **Typing is ephemeral.** A `typing` frame is authorized exactly like a send
-  (membership, then the block rules) and forwarded only to the other
-  participant's live sockets. Nothing is written to the database, and no history
-  or replay contains it. Blocked pairs get `forbidden` and the indicator is not
-  forwarded.
+  (membership, then the direct-chat block rules) and forwarded only to the other
+  member(s)' live sockets. Nothing is written to the database, and no history or
+  replay contains it. In a direct chat, blocked pairs get `forbidden` and the
+  indicator is not forwarded; group typing is not suppressed by a pairwise
+  block.
 * **Last seen.** Authenticating refreshes `last_seen_at` (throttled by
   `LAST_SEEN_UPDATE_INTERVAL_SECONDS`); closing the **last** socket of an account
   records it immediately. Presence itself is never broadcast, and other accounts
@@ -1203,10 +1405,11 @@ Unexpected failures are normalised to a consistent JSON envelope:
 
 ## Roadmap
 
-Groups, shared object storage (MinIO/S3), and E2EE are planned for later
-stages, and realtime fan-out needs a shared pub/sub store to run in more than one
-process. When the service scales horizontally, move the rate limiters, the token
-denylist and the connection registry to a shared store (for example Redis).
+Channels/broadcast lists, shared object storage (MinIO/S3), and E2EE are planned
+for later stages, and realtime fan-out needs a shared pub/sub store to run in
+more than one process. When the service scales horizontally, move the rate
+limiters, the token denylist and the connection registry to a shared store (for
+example Redis).
 
 ### Known limitations in this phase
 
@@ -1239,13 +1442,14 @@ denylist and the connection registry to a shared store (for example Redis).
 * **The per-peer pending cap depends on the proxy.** It keys on
   `request.client.host`; behind a proxy that does not preserve the client
   address, all sockets share the proxy's key.
-* **Delivery/read semantics are simple and one-to-one.** `delivered_at` means
-  "pushed to a live socket of the recipient, or later read"; there is no
-  per-device receipt and no push of missed messages on reconnect (the client
-  fetches history and marks read). "Read" is a watermark the client chooses
-  (`last_message_id`), not a per-message acknowledgement. Typing indicators are
-  in-process and ephemeral. Message edits and deletions are still out of scope;
-  media attachments are supported and described above.
+* **Delivery/read semantics are simple and per account, not per device.**
+  In a direct chat `delivered_at` means "pushed to a live socket of the
+  recipient, or later read"; groups store one `message_receipts` row per member.
+  Neither has a per-device receipt or a push of missed messages on reconnect (the
+  client fetches history and marks read). "Read" is a watermark the client
+  chooses (`last_message_id`), not a per-message acknowledgement. Typing
+  indicators are in-process and ephemeral. Message edits and deletions are still
+  out of scope; media attachments are supported and described above.
 * **Media storage is local-disk and single-node.** `LocalStorage` writes under
   `MEDIA_STORAGE_PATH` on the machine running the API. There is no replication,
   shared volume, lifecycle policy or backup integration; a second worker sees the
@@ -1270,11 +1474,32 @@ denylist and the connection registry to a shared store (for example Redis).
 * **Message paging uses `limit`/`offset`.** Ordering is stable (monotonic id),
   but a page fetched while new messages arrive can shift by those new rows; a
   cursor (`before_id`) is the natural upgrade if the UI needs it.
-* **A conversation is fixed to two people.** Group chats need a different
-  membership model and are deliberately out of scope for this phase.
-* **Blocked participants can still read their old history.** The block stops new
-  messages in both directions, but it does not retroactively hide messages the
-  other party already received.
+* **Groups are not channels.** There is no broadcast-only mode, subscriber list,
+  public posting feed, group avatar, group deletion endpoint, invitation expiry or
+  automatic ownership election. A group always has exactly one owner; if the
+  owner account is disabled, an admin cannot take over without the owner
+  transferring first (an operator would need to repair the row).
+* **The denormalised `conversations.owner_id` has no database FK.** SQLite cannot
+  add a named FK with `ALTER TABLE`, and rebuilding the parent table while child
+  FKs exist is unsafe. The `owner` membership role is the authorization source of
+  truth; the service keeps `owner_id` in sync on creation and transfer. There is
+  no account-deletion endpoint that could orphan it in this phase.
+* **Group read counts include receipts from former members.** A member who read a
+  message before leaving keeps their receipt, so the historical count remains
+  truthful; the member count is current, so counts can briefly exceed the number
+  of current recipients. Receipts are not deleted on leave/removal.
+* **Blocks do not remove existing group members.** A block prevents invitations
+  and public-group joins involving the blocker, but an existing multi-party group
+  keeps its members and message flow. Creating a block is not a group
+  administration action.
+* **Group and public search paging use `limit`/`offset`.** Ordering is stable by
+  activity and id, but pages can shift while new messages arrive; a cursor is the
+  natural upgrade. Search is substring matching on name/description only (no
+  fuzzy ranking, member search or private-group discovery).
+* **Blocked participants can still read their old direct history.** The block
+  stops new direct messages in both directions, but it does not retroactively
+  hide messages the other party already received. The same is true for group
+  history that was visible while the account was a member.
 
 ### Deliberately deferred (with design)
 

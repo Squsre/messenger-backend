@@ -32,7 +32,14 @@ from app.core.errors import (
     NotFoundError,
 )
 from app.core.security import CLIENT_MESSAGE_ID_MAX_LENGTH, MESSAGE_MAX_LENGTH
-from app.db.models import Conversation, ConversationMember, Media, Message, User
+from app.db.models import (
+    Conversation,
+    ConversationKind,
+    ConversationMember,
+    Media,
+    Message,
+    User,
+)
 from app.services.contact import is_blocked_between
 from app.services.media import attach_to_message
 
@@ -77,6 +84,24 @@ def require_membership(db: Session, *, conversation_id: int, user_id: int) -> Co
     return conversation
 
 
+def require_direct_membership(
+    db: Session, *, conversation_id: int, user_id: int
+) -> Conversation:
+    """Like :func:`require_membership`, but only for one-to-one chats.
+
+    Group conversations live in the same table, so a direct-chat route must
+    reject a group id explicitly. Otherwise a group id could be treated as a
+    two-person conversation (and ``other_participant`` would pick an arbitrary
+    member).
+    """
+    conversation = require_membership(
+        db, conversation_id=conversation_id, user_id=user_id
+    )
+    if conversation.kind != ConversationKind.DIRECT.value:
+        raise NotFoundError("Conversation not found.")
+    return conversation
+
+
 def get_or_create_conversation(
     db: Session,
     *,
@@ -99,7 +124,10 @@ def get_or_create_conversation(
 
     pair_key = pair_key_for(initiator.id, target.id)
     existing = db.execute(
-        select(Conversation).where(Conversation.pair_key == pair_key)
+        select(Conversation).where(
+            Conversation.pair_key == pair_key,
+            Conversation.kind == ConversationKind.DIRECT.value,
+        )
     ).scalar_one_or_none()
     if existing is not None:
         return existing, False
@@ -108,7 +136,9 @@ def get_or_create_conversation(
         # The row(s) are added *inside* the savepoint, so losing the race rolls
         # back only this attempt and leaves the request transaction usable.
         with db.begin_nested():
-            conversation = Conversation(pair_key=pair_key)
+            conversation = Conversation(
+                pair_key=pair_key, kind=ConversationKind.DIRECT.value
+            )
             db.add(conversation)
             db.flush()
             db.add_all(
@@ -121,7 +151,10 @@ def get_or_create_conversation(
     except IntegrityError:
         # A concurrent request created the same pair first; use theirs.
         conversation = db.execute(
-            select(Conversation).where(Conversation.pair_key == pair_key)
+            select(Conversation).where(
+                Conversation.pair_key == pair_key,
+                Conversation.kind == ConversationKind.DIRECT.value,
+            )
         ).scalar_one()
         return conversation, False
 
@@ -129,11 +162,18 @@ def get_or_create_conversation(
 
 
 def _member_conversations(user_id: int) -> Select[tuple[Conversation]]:
-    """Conversations ``user_id`` participates in."""
+    """Direct conversations ``user_id`` participates in.
+
+    Groups have their own list endpoint and are deliberately excluded so the
+    two-person response shape (``participant``) stays valid.
+    """
     return (
         select(Conversation)
         .join(ConversationMember, ConversationMember.conversation_id == Conversation.id)
-        .where(ConversationMember.user_id == user_id)
+        .where(
+            ConversationMember.user_id == user_id,
+            Conversation.kind == ConversationKind.DIRECT.value,
+        )
     )
 
 
@@ -321,12 +361,15 @@ def send_message(
     # Block rules are evaluated *before* an idempotent replay. A blocked pair
     # must never receive a success-shaped response for a retry: the old message
     # stays in history, but the socket cannot use retries to keep a send path
-    # open after the block.
-    recipient = other_participant(
-        db, conversation_id=conversation.id, viewer_id=sender.id
-    )
-    if is_blocked_between(db, sender.id, recipient.id):
-        raise ForbiddenError("This user is not available.")
+    # open after the block. Group messages are multi-party and are not
+    # suppressed by a pairwise block; invitations are where blocks are checked
+    # for groups.
+    if conversation.kind == ConversationKind.DIRECT.value:
+        recipient = other_participant(
+            db, conversation_id=conversation.id, viewer_id=sender.id
+        )
+        if is_blocked_between(db, sender.id, recipient.id):
+            raise ForbiddenError("This user is not available.")
 
     if key is not None:
         existing = db.execute(

@@ -14,6 +14,7 @@ from app.api.v1.endpoints import (
     blocks,
     contacts,
     conversations,
+    groups,
     health,
     media,
     realtime,
@@ -28,5 +29,6 @@ api_router.include_router(users.router)
 api_router.include_router(contacts.router)
 api_router.include_router(blocks.router)
 api_router.include_router(conversations.router)
+api_router.include_router(groups.router)
 api_router.include_router(media.router, tags=["media"])
 api_router.include_router(realtime.router)

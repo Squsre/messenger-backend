@@ -34,7 +34,7 @@ from app.core.errors import (
     NotFoundError,
     PayloadTooLargeError,
 )
-from app.db.models import Message, User
+from app.db.models import ConversationKind, Message, User
 from app.db.session import get_db
 from app.schemas.chat import build_message
 from app.schemas.media import (
@@ -356,8 +356,8 @@ def delete_media(
     description=(
         "Attach one of my unattached uploads to a message I sent in the same "
         "conversation. The media must belong to me and the message must not "
-        "already have media. The update is broadcast to both participants as a "
-        "``message_updated`` WebSocket event (when they have live sockets)."
+        "already have media. The update is broadcast to every conversation member "
+        "as a ``message_updated`` WebSocket event (when they have live sockets)."
     ),
     responses=_MEDIA_ERRORS,
 )
@@ -387,11 +387,15 @@ async def attach_media(
         raise NotFoundError("Message not found.")
     if message.sender_id != current_user.id:
         raise ForbiddenError("You can only attach media to your own messages.")
-    recipient = chat_service.other_participant(
-        db, conversation_id=media.conversation_id, viewer_id=current_user.id
+    conversation = chat_service.require_membership(
+        db, conversation_id=media.conversation_id, user_id=current_user.id
     )
-    if is_blocked_between(db, current_user.id, recipient.id):
-        raise ForbiddenError("This user is not available.")
+    if conversation.kind == ConversationKind.DIRECT.value:
+        recipient = chat_service.other_participant(
+            db, conversation_id=media.conversation_id, viewer_id=current_user.id
+        )
+        if is_blocked_between(db, current_user.id, recipient.id):
+            raise ForbiddenError("This user is not available.")
 
     media_service.attach_to_message(db, media=media, message=message)
     rendered = build_message(

@@ -89,6 +89,12 @@ AVATAR_KEY_MAX_LENGTH = 255
 # table, so the limit also holds when application code is bypassed.
 MESSAGE_MAX_LENGTH = 4000
 
+# Group display names and descriptions. They are trimmed at the boundary and
+# mirrored by the schema (the database columns are bounded too).
+GROUP_NAME_MIN_LENGTH = 1
+GROUP_NAME_MAX_LENGTH = 64
+GROUP_DESCRIPTION_MAX_LENGTH = 280
+
 # Optional idempotency key sent by realtime clients. Bounded so it cannot be
 # used as an unbounded side channel; stored only in ``messages``.
 CLIENT_MESSAGE_ID_MAX_LENGTH = 64

@@ -351,7 +351,7 @@ def get_conversation(
     """Return a conversation, or 404 when I am not a participant."""
     deps.enforce_rate_limit(request, settings, "chat", f"user:{current_user.id}")
 
-    conversation = chat_service.require_membership(
+    conversation = chat_service.require_direct_membership(
         db, conversation_id=conversation_id, user_id=current_user.id
     )
     participant = chat_service.other_participant(
@@ -401,7 +401,7 @@ async def send_message(
     """Store a message from the caller and fan it out to live sockets."""
     deps.enforce_rate_limit(request, settings, "chat", f"user:{current_user.id}")
 
-    conversation = chat_service.require_membership(
+    conversation = chat_service.require_direct_membership(
         db, conversation_id=conversation_id, user_id=current_user.id
     )
     media = None
@@ -492,7 +492,7 @@ async def mark_conversation_read(
     """Mark incoming messages up to ``last_message_id`` as read."""
     deps.enforce_rate_limit(request, settings, "chat", f"user:{current_user.id}")
 
-    conversation = chat_service.require_membership(
+    conversation = chat_service.require_direct_membership(
         db, conversation_id=conversation_id, user_id=current_user.id
     )
     state = chat_service.mark_read(
@@ -553,7 +553,7 @@ def list_messages(
     """Return a page of a conversation's messages."""
     deps.enforce_rate_limit(request, settings, "chat", f"user:{current_user.id}")
 
-    conversation = chat_service.require_membership(
+    conversation = chat_service.require_direct_membership(
         db, conversation_id=conversation_id, user_id=current_user.id
     )
     effective_limit = min(limit, settings.message_max_limit)

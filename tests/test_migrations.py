@@ -24,7 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 #: Revision created by the phase-3 migration; the base point for data-preservation
 #: tests, because it is the last schema that existed before the profile phase.
 AUTH_REVISION = "0002_create_users_and_token_blocklist"
-HEAD_REVISION = "0007_add_media"
+HEAD_REVISION = "0008_add_groups"
 
 _USERNAME_PATTERN = re.compile(r"^[a-z0-9_]{3,32}$")
 
@@ -65,6 +65,8 @@ def test_upgrade_head_creates_schema(migration_url: str) -> None:
             "conversation_members",
             "messages",
             "media",
+            "group_invitations",
+            "message_receipts",
             "alembic_version",
         } <= tables
 
@@ -132,14 +134,23 @@ def test_upgrade_head_creates_schema(migration_url: str) -> None:
         conversation_columns = {
             column["name"] for column in inspector.get_columns("conversations")
         }
-        assert {"id", "pair_key", "last_message_at", "created_at", "updated_at"} <= (
-            conversation_columns
-        )
+        assert {
+            "id",
+            "pair_key",
+            "kind",
+            "name",
+            "description",
+            "visibility",
+            "owner_id",
+            "last_message_at",
+            "created_at",
+            "updated_at",
+        } <= conversation_columns
 
         member_columns = {
             column["name"] for column in inspector.get_columns("conversation_members")
         }
-        assert {"id", "conversation_id", "user_id", "created_at"} <= member_columns
+        assert {"id", "conversation_id", "user_id", "role", "created_at"} <= member_columns
 
         message_columns = {column["name"] for column in inspector.get_columns("messages")}
         assert {"id", "conversation_id", "sender_id", "body", "created_at"} <= message_columns
@@ -177,6 +188,55 @@ def test_upgrade_head_creates_schema(migration_url: str) -> None:
             "ck_media_dimensions_valid",
             "ck_media_status_allowed",
         } <= media_checks
+
+        invitation_columns = {
+            column["name"]
+            for column in inspector.get_columns("group_invitations")
+        }
+        assert {
+            "id",
+            "conversation_id",
+            "inviter_id",
+            "invitee_id",
+            "status",
+            "created_at",
+            "responded_at",
+        } <= invitation_columns
+        invitation_checks = {
+            constraint["name"]
+            for constraint in inspector.get_check_constraints("group_invitations")
+        }
+        assert {
+            "ck_group_invitations_status_allowed",
+            "ck_group_invitations_no_self_invite",
+        } <= invitation_checks
+        invitation_indexes = {
+            index["name"] for index in inspector.get_indexes("group_invitations")
+        }
+        assert {
+            "ix_group_invitations_conversation_status",
+            "ix_group_invitations_invitee_status",
+            "ix_group_invitations_inviter_id",
+            "uq_group_invitations_pending",
+        } <= invitation_indexes
+
+        receipt_columns = {
+            column["name"] for column in inspector.get_columns("message_receipts")
+        }
+        assert {
+            "id",
+            "message_id",
+            "user_id",
+            "delivered_at",
+            "read_at",
+        } <= receipt_columns
+        receipt_indexes = {
+            index["name"] for index in inspector.get_indexes("message_receipts")
+        }
+        assert {
+            "ix_message_receipts_user_id_read_at",
+            "ix_message_receipts_message_id_read_at",
+        } <= receipt_indexes
     finally:
         engine.dispose()
 
@@ -233,6 +293,11 @@ def test_migrations_do_not_rewrite_earlier_revisions() -> None:
     media = (versions / "0007_add_media.py").read_text(encoding="utf-8")
     assert 'revision: str = "0007_add_media"' in media
     assert "0008" not in media
+
+    groups = (versions / "0008_add_groups.py").read_text(encoding="utf-8")
+    assert 'revision: str = "0008_add_groups"' in groups
+    assert 'down_revision: str | None = "0007_add_media"' in groups
+    assert "0009" not in groups
 
 
 def test_email_uniqueness_is_enforced_by_the_database(migration_url: str) -> None:
@@ -434,13 +499,13 @@ def test_upgrade_then_downgrade_to_base(migration_url: str) -> None:
         engine.dispose()
 
 
-def test_downgrade_one_step_removes_media_and_restores_non_null_body(
+def test_downgrade_two_steps_removes_groups_and_media(
     migration_url: str,
 ) -> None:
-    """Rolling back only 0007 drops media and restores the text-only body rule."""
+    """Rolling back 0008 and 0007 removes groups/media and restores text-only bodies."""
     config = _alembic_config(migration_url)
     command.upgrade(config, "head")
-    command.downgrade(config, "-1")
+    command.downgrade(config, "-2")
 
     engine = create_db_engine(migration_url)
     try:
@@ -448,6 +513,18 @@ def test_downgrade_one_step_removes_media_and_restores_non_null_body(
         tables = set(inspector.get_table_names())
         assert {"conversations", "conversation_members", "messages"} <= tables
         assert "media" not in tables
+        assert "group_invitations" not in tables
+        assert "message_receipts" not in tables
+
+        conversation_columns = {
+            column["name"] for column in inspector.get_columns("conversations")
+        }
+        assert "kind" not in conversation_columns
+        assert "owner_id" not in conversation_columns
+        member_columns = {
+            column["name"] for column in inspector.get_columns("conversation_members")
+        }
+        assert "role" not in member_columns
 
         message_columns = {
             column["name"]: column for column in inspector.get_columns("messages")
@@ -479,31 +556,8 @@ def test_downgrade_one_step_removes_media_and_restores_non_null_body(
         engine.dispose()
 
 
-def test_downgrade_two_steps_removes_the_status_columns(migration_url: str) -> None:
-    """Rolling back 0007 and 0006 keeps every message and the idempotency key."""
-    config = _alembic_config(migration_url)
-    command.upgrade(config, "head")
-    command.downgrade(config, "-2")
-
-    engine = create_db_engine(migration_url)
-    try:
-        inspector = inspect(engine)
-        tables = set(inspector.get_table_names())
-        assert {"conversations", "conversation_members", "messages"} <= tables
-        assert "media" not in tables
-
-        message_columns = {column["name"] for column in inspector.get_columns("messages")}
-        assert "delivered_at" not in message_columns
-        assert "read_at" not in message_columns
-        assert "client_message_id" in message_columns
-    finally:
-        engine.dispose()
-
-
-def test_downgrade_three_steps_removes_the_idempotency_key(
-    migration_url: str,
-) -> None:
-    """Rolling back 0007-0005 still keeps every chat table and row."""
+def test_downgrade_three_steps_removes_the_status_columns(migration_url: str) -> None:
+    """Rolling back 0008-0006 keeps every message and the idempotency key."""
     config = _alembic_config(migration_url)
     command.upgrade(config, "head")
     command.downgrade(config, "-3")
@@ -514,6 +568,33 @@ def test_downgrade_three_steps_removes_the_idempotency_key(
         tables = set(inspector.get_table_names())
         assert {"conversations", "conversation_members", "messages"} <= tables
         assert "media" not in tables
+        assert "group_invitations" not in tables
+        assert "message_receipts" not in tables
+
+        message_columns = {column["name"] for column in inspector.get_columns("messages")}
+        assert "delivered_at" not in message_columns
+        assert "read_at" not in message_columns
+        assert "client_message_id" in message_columns
+    finally:
+        engine.dispose()
+
+
+def test_downgrade_four_steps_removes_the_idempotency_key(
+    migration_url: str,
+) -> None:
+    """Rolling back 0008-0005 still keeps every chat table and row."""
+    config = _alembic_config(migration_url)
+    command.upgrade(config, "head")
+    command.downgrade(config, "-4")
+
+    engine = create_db_engine(migration_url)
+    try:
+        inspector = inspect(engine)
+        tables = set(inspector.get_table_names())
+        assert {"conversations", "conversation_members", "messages"} <= tables
+        assert "media" not in tables
+        assert "group_invitations" not in tables
+        assert "message_receipts" not in tables
 
         message_columns = {column["name"] for column in inspector.get_columns("messages")}
         assert "client_message_id" not in message_columns
@@ -523,13 +604,13 @@ def test_downgrade_three_steps_removes_the_idempotency_key(
         engine.dispose()
 
 
-def test_downgrade_four_steps_removes_only_the_chat_tables(
+def test_downgrade_five_steps_removes_only_the_chat_tables(
     migration_url: str,
 ) -> None:
-    """Rolling back 0007-0004 keeps the phase-6 profile schema."""
+    """Rolling back 0008-0004 keeps the phase-6 profile schema."""
     config = _alembic_config(migration_url)
     command.upgrade(config, "head")
-    command.downgrade(config, "-4")
+    command.downgrade(config, "-5")
 
     engine = create_db_engine(migration_url)
     try:
@@ -558,11 +639,11 @@ def test_downgrade_four_steps_removes_only_the_chat_tables(
         engine.dispose()
 
 
-def test_downgrade_five_steps_removes_the_profile_schema(migration_url: str) -> None:
-    """0003's downgrade still works now that 0004-0007 sit on top of it."""
+def test_downgrade_six_steps_removes_the_profile_schema(migration_url: str) -> None:
+    """0003's downgrade still works now that 0004-0008 sit on top of it."""
     config = _alembic_config(migration_url)
     command.upgrade(config, "head")
-    command.downgrade(config, "-5")
+    command.downgrade(config, "-6")
 
     engine = create_db_engine(migration_url)
     try:
@@ -644,7 +725,7 @@ def test_status_migration_preserves_existing_messages(migration_url: str) -> Non
     finally:
         engine.dispose()
 
-    command.downgrade(config, "-2")
+    command.downgrade(config, "-3")
 
     engine = create_db_engine(migration_url)
     try:
@@ -862,4 +943,218 @@ def test_downgrade_refuses_to_drop_media_only_messages(migration_url: str) -> No
         engine.dispose()
 
     with pytest.raises(RuntimeError, match="media-only messages"):
+        command.downgrade(config, "-2")
+
+
+def test_group_schema_and_constraints_are_enforced_by_the_database(
+    migration_url: str,
+) -> None:
+    """Group membership, invitation and receipt invariants hold in SQL."""
+    command.upgrade(_alembic_config(migration_url), "head")
+
+    engine = create_db_engine(migration_url)
+    try:
+        with engine.begin() as connection:
+            for email, username in (
+                ("alice@example.com", "alice"),
+                ("bob@example.com", "bob"),
+            ):
+                connection.execute(
+                    text(
+                        "INSERT INTO users (email, username, hashed_password, is_active) "
+                        "VALUES (:email, :username, 'h', 1)"
+                    ),
+                    {"email": email, "username": username},
+                )
+            connection.execute(
+                text(
+                    "INSERT INTO conversations "
+                    "(pair_key, kind, name, visibility, owner_id) "
+                    "VALUES ('group:test', 'group', 'Test Group', 'private', 1)"
+                )
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO conversation_members "
+                    "(conversation_id, user_id, role) VALUES (1, 1, 'owner')"
+                )
+            )
+
+        invitation_insert = text(
+            "INSERT INTO group_invitations "
+            "(conversation_id, inviter_id, invitee_id, status) "
+            "VALUES (1, 1, 2, :status)"
+        )
+        with engine.begin() as connection:
+            connection.execute(invitation_insert, {"status": "pending"})
+
+        # Only one pending invitation per (group, invitee).
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(invitation_insert, {"status": "pending"})
+
+        # After a decline/revoke, a new pending invitation is allowed.
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE group_invitations SET status = 'declined', "
+                    "responded_at = CURRENT_TIMESTAMP WHERE id = 1"
+                )
+            )
+            connection.execute(invitation_insert, {"status": "pending"})
+
+        # The status is a closed set and self-invitations are refused.
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(invitation_insert, {"status": "unknown"})
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "INSERT INTO group_invitations "
+                        "(conversation_id, inviter_id, invitee_id) "
+                        "VALUES (1, 1, 1)"
+                    )
+                )
+
+        # One receipt per message and member.
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO messages (conversation_id, sender_id, body) "
+                    "VALUES (1, 1, 'group message')"
+                )
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO message_receipts (message_id, user_id) "
+                    "VALUES (1, 2)"
+                )
+            )
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "INSERT INTO message_receipts (message_id, user_id) "
+                        "VALUES (1, 2)"
+                    )
+                )
+    finally:
+        engine.dispose()
+
+
+def test_group_upgrade_preserves_existing_direct_rows(migration_url: str) -> None:
+    """0008 backfills direct rows and leaves existing messages/members intact."""
+    config = _alembic_config(migration_url)
+    command.upgrade(config, "0007_add_media")
+
+    engine = create_db_engine(migration_url)
+    try:
+        with engine.begin() as connection:
+            for email, username in (
+                ("alice@example.com", "alice"),
+                ("bob@example.com", "bob"),
+            ):
+                connection.execute(
+                    text(
+                        "INSERT INTO users (email, username, hashed_password, is_active) "
+                        "VALUES (:email, :username, 'h', 1)"
+                    ),
+                    {"email": email, "username": username},
+                )
+            connection.execute(
+                text("INSERT INTO conversations (pair_key) VALUES ('1:2')")
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO conversation_members (conversation_id, user_id) "
+                    "VALUES (1, 1), (1, 2)"
+                )
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO messages (conversation_id, sender_id, body) "
+                    "VALUES (1, 1, 'before groups')"
+                )
+            )
+    finally:
+        engine.dispose()
+
+    command.upgrade(config, "head")
+
+    engine = create_db_engine(migration_url)
+    try:
+        with engine.connect() as connection:
+            conversation = connection.execute(
+                text(
+                    "SELECT pair_key, kind, name, description, visibility, owner_id "
+                    "FROM conversations WHERE id = 1"
+                )
+            ).one()
+            roles = connection.execute(
+                text(
+                    "SELECT role FROM conversation_members "
+                    "WHERE conversation_id = 1 ORDER BY user_id"
+                )
+            ).scalars().all()
+            message = connection.execute(
+                text("SELECT body FROM messages WHERE id = 1")
+            ).scalar_one()
+            group_tables = connection.execute(
+                text(
+                    "SELECT COUNT(*) FROM group_invitations"
+                )
+            ).scalar_one()
+        assert conversation.pair_key == "1:2"
+        assert conversation.kind == "direct"
+        assert conversation.name is None
+        assert conversation.description is None
+        assert conversation.visibility is None
+        assert conversation.owner_id is None
+        assert roles == ["member", "member"]
+        assert message == "before groups"
+        assert group_tables == 0
+    finally:
+        engine.dispose()
+
+
+def test_downgrade_refuses_to_delete_existing_groups(migration_url: str) -> None:
+    """0008 must not silently discard group data on rollback."""
+    config = _alembic_config(migration_url)
+    command.upgrade(config, "head")
+
+    engine = create_db_engine(migration_url)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO users (email, username, hashed_password, is_active) "
+                    "VALUES ('alice@example.com', 'alice', 'h', 1)"
+                )
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO conversations "
+                    "(pair_key, kind, name, visibility, owner_id) "
+                    "VALUES ('group:keep', 'group', 'Keep Me', 'private', 1)"
+                )
+            )
+    finally:
+        engine.dispose()
+
+    with pytest.raises(RuntimeError, match="group conversations"):
         command.downgrade(config, "-1")
+
+    engine = create_db_engine(migration_url)
+    try:
+        with engine.connect() as connection:
+            group = connection.execute(
+                text(
+                    "SELECT name, kind FROM conversations "
+                    "WHERE pair_key = 'group:keep'"
+                )
+            ).one()
+        assert group.name == "Keep Me"
+        assert group.kind == "group"
+    finally:
+        engine.dispose()

@@ -82,7 +82,7 @@ from starlette.websockets import WebSocketState
 
 from app.core.config import Settings
 from app.core.errors import AppError, ForbiddenError, UnauthorizedError
-from app.db.models import User
+from app.db.models import ConversationKind, User
 from app.db.session import Database
 from app.schemas.chat import build_message
 from app.schemas.realtime import (
@@ -106,6 +106,7 @@ from app.schemas.realtime import (
 )
 from app.schemas.user import build_public_profile
 from app.services import chat as chat_service
+from app.services import group as group_service
 from app.services import media as media_service
 from app.services.auth import resolve_access_token
 from app.services.contact import is_blocked_between
@@ -385,15 +386,27 @@ async def _dispatch(
             member_ids = chat_service.conversation_member_ids(
                 db, conversation_id=conversation.id
             )
-            # Delivery means "pushed to a live device". Mark it in the same
-            # transaction as the message so the ack and the event agree.
+            # Delivery means "pushed to a live device". Direct chats store one
+            # pair of timestamps on the message; groups store one receipt per
+            # member, so one member's receipt never marks the message delivered
+            # or read for everyone else.
             delivered_at = None
             if created:
-                recipient_ids = [uid for uid in member_ids if uid != user.id]
-                if any(manager.connection_count(uid) for uid in recipient_ids):
-                    message.delivered_at = chat_service.utcnow()
-                    db.flush()
-                    delivered_at = message.delivered_at
+                if conversation.kind == ConversationKind.GROUP.value:
+                    online = [
+                        user_id
+                        for user_id in member_ids
+                        if user_id != user.id and manager.connection_count(user_id)
+                    ]
+                    group_service.record_delivery(
+                        db, message=message, user_ids=online
+                    )
+                else:
+                    recipient_ids = [uid for uid in member_ids if uid != user.id]
+                    if any(manager.connection_count(uid) for uid in recipient_ids):
+                        message.delivered_at = chat_service.utcnow()
+                        db.flush()
+                        delivered_at = message.delivered_at
             rendered = build_message(
                 message, sender_username=user.username, media=media
             )
@@ -481,7 +494,7 @@ async def _handle_read(
     manager: ConnectionManager,
     database: Database,
 ) -> None:
-    """Persist a read watermark and tell both participants' sockets."""
+    """Persist a read watermark and tell the conversation's member sockets."""
     now = time.monotonic()
     if now - connection.last_read_at < settings.ws_read_min_interval_seconds:
         retry_after = max(
@@ -510,12 +523,20 @@ async def _handle_read(
             conversation = chat_service.require_membership(
                 db, conversation_id=frame.conversation_id, user_id=user.id
             )
-            state = chat_service.mark_read(
-                db,
-                conversation_id=conversation.id,
-                reader_id=user.id,
-                last_message_id=frame.last_message_id,
-            )
+            if conversation.kind == ConversationKind.GROUP.value:
+                state = group_service.mark_group_read(
+                    db,
+                    group_id=conversation.id,
+                    reader_id=user.id,
+                    last_message_id=frame.last_message_id,
+                )
+            else:
+                state = chat_service.mark_read(
+                    db,
+                    conversation_id=conversation.id,
+                    reader_id=user.id,
+                    last_message_id=frame.last_message_id,
+                )
             member_ids = chat_service.conversation_member_ids(
                 db, conversation_id=conversation.id
             )
@@ -559,7 +580,7 @@ async def _handle_typing(
     manager: ConnectionManager,
     database: Database,
 ) -> None:
-    """Forward an ephemeral typing state to the other participant.
+    """Forward an ephemeral typing state to the other participant(s).
 
     Nothing is written to the database: the indicator carries an expiry so a
     client that disappears cannot leave it stuck on. Only the ``start`` frames
@@ -594,13 +615,22 @@ async def _handle_typing(
             conversation = chat_service.require_membership(
                 db, conversation_id=frame.conversation_id, user_id=user.id
             )
-            recipient = chat_service.other_participant(
-                db, conversation_id=conversation.id, viewer_id=user.id
-            )
-            if is_blocked_between(db, user.id, recipient.id):
-                # Typing is a send: it is suppressed in both directions.
-                raise ForbiddenError("This user is not available.")
-            recipient_id = recipient.id
+            if conversation.kind == ConversationKind.GROUP.value:
+                recipient_ids = [
+                    member_id
+                    for member_id in chat_service.conversation_member_ids(
+                        db, conversation_id=conversation.id
+                    )
+                    if member_id != user.id
+                ]
+            else:
+                recipient = chat_service.other_participant(
+                    db, conversation_id=conversation.id, viewer_id=user.id
+                )
+                if is_blocked_between(db, user.id, recipient.id):
+                    # Typing is a send: it is suppressed in both directions.
+                    raise ForbiddenError("This user is not available.")
+                recipient_ids = [recipient.id]
             username = user.username
     except UnauthorizedError as exc:
         await _send_error(manager, connection, exc.code, exc.message)
@@ -622,7 +652,7 @@ async def _handle_typing(
         return
 
     await manager.broadcast(
-        user_ids=[recipient_id],
+        user_ids=recipient_ids,
         payload=TypingEvent(
             conversation_id=conversation.id,
             username=username,

@@ -7,11 +7,17 @@ creating a module in this package and re-exporting it here.
 
 from app.db.models.block import Block
 from app.db.models.contact import Contact
-from app.db.models.conversation import Conversation
-from app.db.models.conversation_member import ConversationMember
+from app.db.models.conversation import (
+    Conversation,
+    ConversationKind,
+    GroupVisibility,
+)
+from app.db.models.conversation_member import ConversationMember, GroupRole
+from app.db.models.group_invitation import GroupInvitation, InvitationStatus
 from app.db.models.health_check import HealthCheck
 from app.db.models.media import Media
 from app.db.models.message import Message
+from app.db.models.message_receipt import MessageReceipt
 from app.db.models.token_blocklist import TokenBlocklist
 from app.db.models.user import PROFILE_VISIBILITY_VALUES, ProfileVisibility, User
 from app.db.models.user_session import UserSession
@@ -21,10 +27,16 @@ __all__ = [
     "Block",
     "Contact",
     "Conversation",
+    "ConversationKind",
     "ConversationMember",
+    "GroupInvitation",
+    "GroupRole",
+    "GroupVisibility",
     "HealthCheck",
+    "InvitationStatus",
     "Media",
     "Message",
+    "MessageReceipt",
     "PROFILE_VISIBILITY_VALUES",
     "ProfileVisibility",
     "TokenBlocklist",
