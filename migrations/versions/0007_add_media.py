@@ -99,8 +99,15 @@ def upgrade() -> None:
     if dialect == "sqlite":
         _rebuild_messages(nullable_body=True)
     else:
-        op.drop_constraint("ck_messages_body_not_blank", "messages", type_="check")
-        op.drop_constraint("ck_messages_body_too_long", "messages", type_="check")
+        # ``op.f`` marks these as final names. Without it Alembic applies the
+        # ``ck_%(table_name)s_%(constraint_name)s`` naming convention a second
+        # time and PostgreSQL looks for ``ck_messages_ck_messages_...``.
+        op.drop_constraint(
+            op.f("ck_messages_body_not_blank"), "messages", type_="check"
+        )
+        op.drop_constraint(
+            op.f("ck_messages_body_too_long"), "messages", type_="check"
+        )
         op.alter_column(
             "messages",
             "body",
@@ -108,12 +115,12 @@ def upgrade() -> None:
             nullable=True,
         )
         op.create_check_constraint(
-            "ck_messages_body_not_blank",
+            op.f("ck_messages_body_not_blank"),
             "messages",
             "body IS NULL OR length(trim(body)) > 0",
         )
         op.create_check_constraint(
-            "ck_messages_body_too_long",
+            op.f("ck_messages_body_too_long"),
             "messages",
             f"body IS NULL OR length(body) <= {_MESSAGE_MAX_LENGTH}",
         )
@@ -209,8 +216,12 @@ def downgrade() -> None:
     if dialect == "sqlite":
         _rebuild_messages(nullable_body=False)
     else:
-        op.drop_constraint("ck_messages_body_not_blank", "messages", type_="check")
-        op.drop_constraint("ck_messages_body_too_long", "messages", type_="check")
+        op.drop_constraint(
+            op.f("ck_messages_body_not_blank"), "messages", type_="check"
+        )
+        op.drop_constraint(
+            op.f("ck_messages_body_too_long"), "messages", type_="check"
+        )
         op.alter_column(
             "messages",
             "body",
@@ -218,12 +229,12 @@ def downgrade() -> None:
             nullable=False,
         )
         op.create_check_constraint(
-            "ck_messages_body_not_blank",
+            op.f("ck_messages_body_not_blank"),
             "messages",
             "length(trim(body)) > 0",
         )
         op.create_check_constraint(
-            "ck_messages_body_too_long",
+            op.f("ck_messages_body_too_long"),
             "messages",
             f"length(body) <= {_MESSAGE_MAX_LENGTH}",
         )

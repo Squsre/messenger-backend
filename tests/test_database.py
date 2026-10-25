@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
+from app.core.config import DatabaseSettings
 from app.db.base import Base
 from app.db.models import HealthCheck
 from app.db.session import Database, create_db_engine, get_db
@@ -26,6 +27,40 @@ def test_engine_connects(db_url: str) -> None:
             assert connection.execute(text("SELECT 1")).scalar_one() == 1
     finally:
         engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (
+            "postgres://user:pass@localhost:5432/messenger",
+            "postgresql+psycopg://user:pass@localhost:5432/messenger",
+        ),
+        (
+            "postgresql://user:pass@localhost:5432/messenger",
+            "postgresql+psycopg://user:pass@localhost:5432/messenger",
+        ),
+        (
+            "postgresql+psycopg://user:pass@localhost:5432/messenger",
+            "postgresql+psycopg://user:pass@localhost:5432/messenger",
+        ),
+    ],
+)
+def test_postgres_url_shorthand_is_normalised(raw: str, expected: str) -> None:
+    settings = DatabaseSettings(database_url=raw)
+    assert settings.database_url == expected
+
+
+def test_safe_url_redacts_the_password() -> None:
+    database = Database(
+        "postgresql+psycopg://messenger:s3cret@127.0.0.1:5432/messenger"
+    )
+    try:
+        assert database.safe_url == (
+            "postgresql+psycopg://messenger:***@127.0.0.1:5432/messenger"
+        )
+    finally:
+        database.dispose()
 
 
 def test_tables_are_created(database: Database, schema: None) -> None:

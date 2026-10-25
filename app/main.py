@@ -159,7 +159,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        logger.info("Database engine ready (%s)", settings.database_url)
+        logger.info("Database engine ready (%s)", database.safe_url)
         try:
             yield
         finally:

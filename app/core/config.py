@@ -53,8 +53,10 @@ MIN_SECRET_LENGTH = 32
 class DatabaseSettings(BaseSettings):
     """The subset of settings needed to reach the database.
 
-    Kept free of secrets so tooling such as Alembic can resolve the database URL
-    without requiring the application's JWT key.
+    Deliberately independent of the application's JWT secret so tooling such as
+    Alembic can resolve ``DATABASE_URL`` without loading the full application
+    configuration. The URL itself may contain a database password; it is read
+    from the environment or a Git-ignored ``.env`` and must never be committed.
     """
 
     model_config = SettingsConfigDict(
@@ -65,12 +67,13 @@ class DatabaseSettings(BaseSettings):
     )
 
     # --- Database ---
-    # A SQLAlchemy URL. SQLite is the default; swapping this value for a
-    # PostgreSQL URL (e.g. ``postgresql+psycopg://user:pass@host/db``) is the
-    # only change required to move to PostgreSQL later on.
+    # PostgreSQL is the primary deployment database. SQLite remains the
+    # zero-setup fallback (and the default used by isolated tests) so importing
+    # settings never requires a running server. Set DATABASE_URL to a
+    # ``postgresql+psycopg://...`` URL in the environment or .env for PostgreSQL.
     database_url: str = Field(
         default="sqlite:///./messenger.db",
-        description="SQLAlchemy database URL.",
+        description="SQLAlchemy database URL (PostgreSQL or SQLite).",
     )
     db_echo: bool = Field(default=False, description="Log every SQL statement.")
 

@@ -23,7 +23,7 @@ from functools import lru_cache
 
 from fastapi import Request
 from sqlalchemy import create_engine
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -34,9 +34,9 @@ def create_db_engine(url: str, *, echo: bool = False) -> Engine:
     """Build a SQLAlchemy engine suitable for the given URL.
 
     SQLite needs a couple of tweaks (``check_same_thread`` and, for in-memory
-    databases, a shared static pool). Everything else — PostgreSQL included —
-    works with the generic settings so the switch later is a configuration
-    change only.
+    databases, a shared static pool). PostgreSQL uses SQLAlchemy's normal
+    connection pool; ``pool_pre_ping`` protects both backends from stale
+    connections. The only difference between environments is ``DATABASE_URL``.
     """
     options: dict[str, object] = {"echo": echo, "pool_pre_ping": True, "future": True}
 
@@ -62,6 +62,15 @@ class Database:
         self.url = url
         self.engine = create_db_engine(url, echo=echo)
         self.session_factory = create_session_factory(self.engine)
+
+    @property
+    def safe_url(self) -> str:
+        """The database URL with any password redacted, safe for logs.
+
+        ``DATABASE_URL`` may contain a PostgreSQL password. Startup logs and
+        diagnostics must never print it verbatim.
+        """
+        return make_url(self.url).render_as_string(hide_password=True)
 
     @contextmanager
     def session(self) -> Iterator[Session]:

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from logging.config import fileConfig
 
+import sqlalchemy as sa
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
@@ -43,15 +44,61 @@ def _resolve_url() -> str:
     return get_database_settings().database_url
 
 
+def _ensure_postgres_version_table(connection: sa.Connection) -> None:
+    """Widen Alembic's bookkeeping column before the first migration runs.
+
+    Alembic 1.14 creates ``alembic_version.version_num`` as ``VARCHAR(32)``.
+    This project's revision ids are longer (for example
+    ``0002_create_users_and_token_blocklist`` is 38 characters). SQLite ignores
+    the length, but PostgreSQL rejects the update and the migration fails.
+
+    Pre-creating the tiny bookkeeping table with a wider column is safe: it is
+    not application data and it does not rewrite any migration. Existing
+    PostgreSQL databases created by an older attempt are widened in place.
+    """
+
+    if connection.dialect.name != "postgresql":
+        return
+
+    with connection.begin():
+        inspector = sa.inspect(connection)
+        if "alembic_version" not in inspector.get_table_names():
+            connection.execute(
+                sa.text(
+                    "CREATE TABLE alembic_version ("
+                    "version_num VARCHAR(255) NOT NULL, "
+                    "CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num))"
+                )
+            )
+            return
+
+        columns = {
+            column["name"]: column
+            for column in inspector.get_columns("alembic_version")
+        }
+        version_type = columns.get("version_num", {}).get("type")
+        length = getattr(version_type, "length", None)
+        if length is not None and length < 255:
+            connection.execute(
+                sa.text(
+                    "ALTER TABLE alembic_version "
+                    "ALTER COLUMN version_num TYPE VARCHAR(255)"
+                )
+            )
+
+
 def run_migrations_offline() -> None:
     """Run migrations in 'offline' mode (emit SQL without a DBAPI connection)."""
+    url = _resolve_url()
     context.configure(
-        url=_resolve_url(),
+        url=url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
-        render_as_batch=True,
+        # Batch mode is a SQLite workaround; using it for PostgreSQL offline
+        # output would emit table-rebuild SQL that PostgreSQL does not need.
+        render_as_batch=url.startswith("sqlite"),
     )
 
     with context.begin_transaction():
@@ -70,6 +117,8 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
+        # Must happen before context.configure() creates the version table.
+        _ensure_postgres_version_table(connection)
         context.configure(
             connection=connection,
             target_metadata=target_metadata,

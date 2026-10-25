@@ -1,7 +1,8 @@
 # Messenger — Backend API
 
 Backend for the messenger project, built with **Python 3.11**, **FastAPI** and
-**SQLAlchemy 2.0** (SQLite by default), with **Alembic** for migrations and
+**SQLAlchemy 2.0** (PostgreSQL primary; SQLite fallback for tests), with
+**Alembic** for migrations and
 **Argon2id + JWT** authentication.
 
 > Delivered so far:
@@ -20,6 +21,9 @@ Backend for the messenger project, built with **Python 3.11**, **FastAPI** and
 > **Stage 11** — private/public groups, owner/admin/member roles, invitations,
 > member management, group messaging with per-member delivery/read receipts, and
 > membership-scoped WebSocket group events.
+> **Stage 12** — PostgreSQL as the primary database: `psycopg` driver, a
+> development `compose.yaml`, PostgreSQL-safe migrations, credential-redacted
+> logs, and opt-in PostgreSQL integration tests.
 >
 > E2EE is still to come. Two-factor authentication and contact *requests* are
 > deliberately deferred and documented in the roadmap. Files are stored locally
@@ -140,8 +144,10 @@ messenger/
 │   ├── _groups.py              # group endpoint helpers (not collected)
 │   ├── test_groups.py          # groups, discovery, invitations, roles, membership
 │   ├── test_group_messages.py  # group messages, per-member receipts, media
-│   └── test_group_realtime.py  # group event fan-out and WebSocket authorization
+│   ├── test_group_realtime.py  # group event fan-out and WebSocket authorization
+│   └── test_postgres.py        # opt-in PostgreSQL connection/migration/constraint tests
 ├── alembic.ini
+├── compose.yaml               # PostgreSQL 16 development service (healthcheck + volume)
 ├── .env.example
 ├── .gitignore
 ├── pytest.ini
@@ -157,12 +163,61 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements-dev.txt
 Copy-Item .env.example .env
+
+# Edit .env: set a real JWT_SECRET_KEY and a local POSTGRES_PASSWORD.
+# Then start PostgreSQL and create the schema:
+docker compose up -d postgres
+.\.venv\Scripts\alembic upgrade head
 ```
+
+The API itself is not containerized in this phase; run it locally with
+`uvicorn app.main:app --reload`. To use the zero-setup SQLite fallback instead,
+set `DATABASE_URL=sqlite:///./messenger.db` in `.env` and skip the compose
+step.
 
 ## Database
 
-SQLite is used by default and lives at `./messenger.db` (configurable through
-`DATABASE_URL`). No server needs to be installed.
+PostgreSQL 16 is the primary development and deployment database.
+`DATABASE_URL` is the only application setting that selects the backend; the
+driver is the `psycopg` 3 binary package added to `requirements.txt`.
+
+SQLite remains fully supported as a zero-setup fallback and is what the
+independent test suite uses by default. The application default is still
+`sqlite:///./messenger.db` so importing settings never needs a running server;
+`.env.example` selects PostgreSQL explicitly.
+
+### Start PostgreSQL for development
+
+`compose.yaml` runs only PostgreSQL (no Redis, MinIO, Celery or API container):
+
+```powershell
+# .env is read automatically by Docker Compose
+docker compose up -d postgres
+docker compose ps
+docker compose logs -f postgres
+```
+
+It uses `postgres:16-alpine`, a named volume (`messenger_postgres_data`), the
+`POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_PORT`
+variables from `.env`, and a `pg_isready` healthcheck. Compose refuses to start
+if `POSTGRES_PASSWORD` is unset. `docker compose down` stops the container and
+keeps the volume; `docker compose down -v` deletes the database volume and must
+be used deliberately.
+
+Set the matching SQLAlchemy URL in `.env`:
+
+```dotenv
+POSTGRES_DB=messenger
+POSTGRES_USER=messenger
+POSTGRES_PASSWORD=your-local-password
+POSTGRES_PORT=5432
+DATABASE_URL=postgresql+psycopg://messenger:your-local-password@127.0.0.1:5432/messenger
+```
+
+URL-encode special characters in a password. `postgres://` and
+`postgresql://` shorthands are normalised to `postgresql+psycopg://` by the
+settings layer. The real password belongs only in the Git-ignored `.env`;
+`.env.example` contains a clearly marked development placeholder.
 
 ### Migrations (Alembic)
 
@@ -187,7 +242,16 @@ SQLite is used by default and lives at `./messenger.db` (configurable through
 ```
 
 The database URL is read from `DATABASE_URL` (via `.env`), so the same commands
-work unchanged after switching to PostgreSQL.
+work for PostgreSQL and SQLite. Stage 12 adds no revision; the schema is still
+the phase-11 head, now verified from an empty PostgreSQL database through every
+upgrade and back down again.
+
+> PostgreSQL note: Alembic 1.14 hardcodes `alembic_version.version_num` as
+> `VARCHAR(32)`, but this project's revision ids are longer (for example
+> `0002_create_users_and_token_blocklist`). `migrations/env.py` widens that
+> bookkeeping table to `VARCHAR(255)` before the first migration and repairs an
+> existing narrow table in place. This changes only Alembic metadata, never an
+> application table or migration history.
 
 Current head: **`0008_add_groups`**. Apply it to an existing
 database (created by an earlier stage) with a single `alembic upgrade head`:
@@ -251,6 +315,24 @@ group memberships, invitations, receipts or messages.
 > has real data without a backup.
 
 
+### Verify the PostgreSQL schema
+
+```powershell
+# From an empty database to the current head
+.\.venv\Scripts\alembic upgrade head
+.\.venv\Scripts\alembic current
+.\.venv\Scripts\alembic check
+
+# Optional destructive check on a throw-away database
+.\.venv\Scripts\alembic downgrade base
+.\.venv\Scripts\alembic upgrade head
+```
+
+Expected: `current` reports `0008_add_groups (head)` and `check` reports
+`No new upgrade operations detected.` The optional PostgreSQL integration test
+(see [Run the tests](#run-the-tests)) repeats this against an isolated schema
+and compares the migrated schema with `Base.metadata`.
+
 ### Session usage in future endpoints
 
 ```python
@@ -276,13 +358,22 @@ with get_database().session() as session:
     session.add(SomeModel(...))
 ```
 
-### Moving to PostgreSQL later
+### Switching between PostgreSQL and SQLite
 
-1. `python -m pip install "psycopg[binary]"` (plus driver of choice).
-2. Set `DATABASE_URL=postgresql+psycopg://user:pass@host:5432/messenger` in `.env`.
-3. Run `alembic upgrade head`.
+1. Set `DATABASE_URL` in `.env` to the desired backend.
+2. Run `alembic upgrade head`.
+3. Start the API with the same environment.
 
-No code changes are required: the engine factory only special-cases SQLite.
+No application code changes are required: the engine factory only special-cases
+SQLite's connection arguments and in-memory pool. PostgreSQL uses SQLAlchemy's
+normal pool with `pool_pre_ping=True`. Startup logs print the URL with the
+password redacted.
+
+**Existing data:** running migrations creates an empty schema. This phase does
+not copy rows from an existing `messenger.db` into PostgreSQL, and it never
+deletes the SQLite file. Moving real data is a separate, explicitly approved
+operation (for example a reviewed `pgloader`/custom export-import after a
+backup); it is deliberately not run automatically.
 
 ## Authentication
 
@@ -1276,7 +1367,25 @@ python -m pytest
 
 Tests never touch `messenger.db`: each one gets a temporary SQLite file. Media
 tests also point `MEDIA_STORAGE_PATH` at a per-test temporary directory, so the
-suite never reads or writes real user uploads. The migration tests run the real
+suite never reads or writes real user uploads.
+
+PostgreSQL integration tests are **opt-in** and skipped unless
+`TEST_POSTGRES_URL` is set:
+
+```powershell
+$env:TEST_POSTGRES_URL = "postgresql+psycopg://messenger:test-password@127.0.0.1:5432/messenger_test"
+.\.venv\Scripts\python.exe -m pytest tests/test_postgres.py -v
+```
+
+Point it at a disposable database. Each test creates a uniquely named schema,
+puts it first on `search_path`, runs the real migrations/CRUD/constraints, and
+drops the schema; the `public` schema and existing data are untouched. The
+tests cover the psycopg connection, `Base.metadata.create_all`, a full
+`alembic upgrade head` from empty, `alembic check`-equivalent metadata
+comparison, downgrade to base, the pending-invitation partial unique index,
+CHECK constraints and the one-receipt-per-member rule.
+
+The migration tests run the real
 `alembic upgrade`/`downgrade` commands against a throw-away database and
 additionally assert that the migrated schema matches the ORM models (no drift);
 they also verify that the `0003` upgrade backfills a unique username for every
@@ -1339,7 +1448,7 @@ variables or the local `.env` file. See `.env.example` for every supported key:
 | `API_V1_PREFIX`  | `/api/v1`             | Prefix for version 1 routes.                   |
 | `HOST` / `PORT`  | `127.0.0.1` / `8000`  | Suggested bind address.                        |
 | `CORS_ORIGINS`   | *(empty)*             | Comma-separated allowed origins.               |
-| `DATABASE_URL`   | `sqlite:///./messenger.db` | SQLAlchemy database URL.                  |
+| `DATABASE_URL`   | `sqlite:///./messenger.db` (code fallback; `.env.example` uses PostgreSQL) | SQLAlchemy URL: `postgresql+psycopg://...` or `sqlite:///...`. |
 | `DB_ECHO`        | `false`               | Log every SQL statement.                       |
 | `JWT_SECRET_KEY` | *(required)*          | HMAC signing key. **No default** — the app will not start without it. |
 | `JWT_ALGORITHM`  | `HS256`               | `HS256` / `HS384` / `HS512` only.              |
@@ -1389,6 +1498,11 @@ variables or the local `.env` file. See `.env.example` for every supported key:
 | `WS_TYPING_EXPIRY_SECONDS` | `5`          | Client-side lifetime of a typing indicator.    |
 | `WS_READ_MIN_INTERVAL_SECONDS` | `0.5`   | Minimum gap between read frames per connection. |
 
+`compose.yaml` also reads `POSTGRES_DB`, `POSTGRES_USER`,
+`POSTGRES_PASSWORD` and `POSTGRES_PORT` from `.env`; those four variables are
+consumed by Docker Compose, not directly by the API. `TEST_POSTGRES_URL` is a
+test-only environment variable and is not part of `Settings`.
+
 Generate a signing key with:
 
 ```powershell
@@ -1407,12 +1521,23 @@ Unexpected failures are normalised to a consistent JSON envelope:
 
 Channels/broadcast lists, shared object storage (MinIO/S3), and E2EE are planned
 for later stages, and realtime fan-out needs a shared pub/sub store to run in
-more than one process. When the service scales horizontally, move the rate
+more than one process. PostgreSQL operational hardening (backups, CI migration
+checks, a reviewed SQLite-to-PostgreSQL data import) and containerizing the API
+are follow-up work. When the service scales horizontally, move the rate
 limiters, the token denylist and the connection registry to a shared store (for
 example Redis).
 
 ### Known limitations in this phase
 
+* **PostgreSQL is supported as a single primary database, not a cluster.** The
+  compose service is for development: one PostgreSQL 16 container, one local
+  volume, and a healthcheck. There is no replication, failover, managed backup,
+  connection pooler or multi-node deployment recipe yet. The API itself is still
+  run outside Docker in this phase.
+* **SQLite data is not copied automatically.** Migrations create the PostgreSQL
+  schema from empty; an existing `messenger.db` is left untouched. A reviewed
+  export/import (after a backup) is required before switching a database with
+  real rows, and has not been performed here.
 * **Rate limiting is per process.** Each uvicorn worker (and each restarted
   process) keeps its own counters, so the effective budget multiplies with the
   worker count. It stops casual abuse, not a distributed attack; a shared store
