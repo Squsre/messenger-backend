@@ -202,13 +202,21 @@ def test_verification_email_is_not_logged_or_returned(client, db_session, api) -
     assert raw_token not in repr(_latest_token_row(db_session))
 
 
-def _console_settings(tmp_path: Path, db_url: str, outbox_dir: Path):
+def _console_settings(
+    tmp_path: Path,
+    db_url: str,
+    outbox_dir: Path,
+    redis_url: str,
+    redis_namespace: str,
+):
     from app.core.config import Settings
 
     return Settings(
         app_env="development",
         app_debug=True,
         database_url=db_url,
+        redis_url=redis_url,
+        redis_key_prefix=redis_namespace,
         jwt_secret_key="console-backend-test-secret-0123456789abcdef",
         email_backend="console",
         email_outbox_dir=str(outbox_dir),
@@ -219,10 +227,19 @@ def _console_settings(tmp_path: Path, db_url: str, outbox_dir: Path):
     )
 
 
-def test_console_backend_writes_the_link_to_the_outbox(tmp_path: Path, db_url: str) -> None:
+def test_console_backend_writes_the_link_to_the_outbox(
+    tmp_path: Path,
+    db_url: str,
+    test_redis_url: str,
+    redis_namespace: str,
+) -> None:
     """Development flow: the link lands in a file, never in the API response."""
     outbox_dir = tmp_path / "outbox"
-    application = create_app(settings=_console_settings(tmp_path, db_url, outbox_dir))
+    application = create_app(
+        settings=_console_settings(
+            tmp_path, db_url, outbox_dir, test_redis_url, redis_namespace
+        )
+    )
     Base.metadata.create_all(bind=application.state.database.engine)
 
     try:
@@ -245,6 +262,7 @@ def test_console_backend_writes_the_link_to_the_outbox(tmp_path: Path, db_url: s
             # The response itself contains no token.
             assert token not in response.text
     finally:
+        application.state.redis_manager.close()
         application.state.database.dispose()
 
 

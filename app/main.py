@@ -21,11 +21,13 @@ from app import __version__
 from app.api.v1.router import api_router
 from app.core.config import Settings, get_settings
 from app.core.errors import register_exception_handlers
-from app.core.rate_limit import SlidingWindowRateLimiter
+from app.core.rate_limit import RedisSlidingWindowRateLimiter
 from app.db.session import Database
 from app.schemas.health import RootResponse
+from app.services.cache import CacheService
 from app.services.email import build_email_service
 from app.services.realtime import ConnectionManager
+from app.services.redis import RedisManager
 from app.services.storage import build_storage
 
 logger = logging.getLogger(__name__)
@@ -92,56 +94,77 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     """Build and return a configured FastAPI application."""
     settings = settings or get_settings()
 
-    # The database instance is created per application so tests can supply an
-    # isolated database through their own settings.
+    # The database and Redis instances are created per application so tests can
+    # supply isolated resources through their own settings.
     database = Database(settings.database_url, echo=settings.db_echo)
+    redis_manager = RedisManager(settings)
+    cache = CacheService(redis_manager, enabled=settings.cache_enabled)
 
-    # In-process login throttle. See app/core/rate_limit.py for its scope and
-    # limitations (single process; a shared store is needed to scale out).
-    login_rate_limiter = SlidingWindowRateLimiter(
-        max_requests=settings.login_rate_limit_attempts,
-        window_seconds=settings.login_rate_limit_window_seconds,
+    def _limiter(
+        scope: str, attempts: int, window_seconds: int
+    ) -> RedisSlidingWindowRateLimiter:
+        return RedisSlidingWindowRateLimiter(
+            redis_manager,
+            scope=scope,
+            max_requests=attempts,
+            window_seconds=window_seconds,
+            failure_policy=settings.rate_limit_failure_policy,
+        )
+
+    # One shared limiter per scope: a noisy feature (say search) cannot spend
+    # another feature's budget. Counters live in Redis, so every worker sees the
+    # same budget. "login" keeps its historical attribute below as well.
+    login_rate_limiter = _limiter(
+        "login",
+        settings.login_rate_limit_attempts,
+        settings.login_rate_limit_window_seconds,
     )
-
-    # One limiter per scope: a noisy feature (say search) cannot spend another
-    # feature's budget. "login" keeps its historical attribute below as well.
-    rate_limiters: dict[str, SlidingWindowRateLimiter] = {
+    rate_limiters: dict[str, RedisSlidingWindowRateLimiter] = {
         "login": login_rate_limiter,
-        "email_verification": SlidingWindowRateLimiter(
-            max_requests=settings.email_rate_limit_attempts,
-            window_seconds=settings.email_rate_limit_window_seconds,
+        "email_verification": _limiter(
+            "email_verification",
+            settings.email_rate_limit_attempts,
+            settings.email_rate_limit_window_seconds,
         ),
-        "email_verify_confirm": SlidingWindowRateLimiter(
-            max_requests=settings.email_rate_limit_attempts,
-            window_seconds=settings.email_rate_limit_window_seconds,
+        "email_verify_confirm": _limiter(
+            "email_verify_confirm",
+            settings.email_rate_limit_attempts,
+            settings.email_rate_limit_window_seconds,
         ),
-        "password_reset": SlidingWindowRateLimiter(
-            max_requests=settings.password_reset_rate_limit_attempts,
-            window_seconds=settings.password_reset_rate_limit_window_seconds,
+        "password_reset": _limiter(
+            "password_reset",
+            settings.password_reset_rate_limit_attempts,
+            settings.password_reset_rate_limit_window_seconds,
         ),
-        "password_reset_confirm": SlidingWindowRateLimiter(
-            max_requests=settings.password_reset_rate_limit_attempts,
-            window_seconds=settings.password_reset_rate_limit_window_seconds,
+        "password_reset_confirm": _limiter(
+            "password_reset_confirm",
+            settings.password_reset_rate_limit_attempts,
+            settings.password_reset_rate_limit_window_seconds,
         ),
-        "search": SlidingWindowRateLimiter(
-            max_requests=settings.search_rate_limit_attempts,
-            window_seconds=settings.search_rate_limit_window_seconds,
+        "search": _limiter(
+            "search",
+            settings.search_rate_limit_attempts,
+            settings.search_rate_limit_window_seconds,
         ),
-        "contact": SlidingWindowRateLimiter(
-            max_requests=settings.contact_rate_limit_attempts,
-            window_seconds=settings.contact_rate_limit_window_seconds,
+        "contact": _limiter(
+            "contact",
+            settings.contact_rate_limit_attempts,
+            settings.contact_rate_limit_window_seconds,
         ),
-        "chat": SlidingWindowRateLimiter(
-            max_requests=settings.chat_rate_limit_attempts,
-            window_seconds=settings.chat_rate_limit_window_seconds,
+        "chat": _limiter(
+            "chat",
+            settings.chat_rate_limit_attempts,
+            settings.chat_rate_limit_window_seconds,
         ),
-        "media": SlidingWindowRateLimiter(
-            max_requests=settings.media_rate_limit_attempts,
-            window_seconds=settings.media_rate_limit_window_seconds,
+        "media": _limiter(
+            "media",
+            settings.media_rate_limit_attempts,
+            settings.media_rate_limit_window_seconds,
         ),
-        "ws": SlidingWindowRateLimiter(
-            max_requests=settings.ws_message_rate_limit_attempts,
-            window_seconds=settings.ws_message_rate_limit_window_seconds,
+        "ws": _limiter(
+            "ws",
+            settings.ws_message_rate_limit_attempts,
+            settings.ws_message_rate_limit_window_seconds,
         ),
     }
 
@@ -160,14 +183,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         logger.info("Database engine ready (%s)", database.safe_url)
+        logger.info("Redis client configured (%s)", redis_manager.safe_url)
+        if not redis_manager.ping():
+            logger.warning(
+                "Redis is not reachable at startup; cache will fail open and rate "
+                "limiting will follow RATE_LIMIT_FAILURE_POLICY=%s",
+                settings.rate_limit_failure_policy,
+            )
         try:
             yield
         finally:
             # Tell every connected client the server is going away before the
-            # database engine is disposed.
+            # database and Redis resources are released.
             await ws_manager.close_all(code=1001, reason="Server is shutting down")
+            redis_manager.close()
             database.dispose()
-            logger.info("Database engine disposed")
+            logger.info("Redis client and database engine disposed")
 
     app = FastAPI(
         title=settings.app_name,
@@ -189,6 +220,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Expose shared resources to dependencies via `app.state`.
     app.state.settings = settings
     app.state.database = database
+    app.state.redis_manager = redis_manager
+    app.state.redis = redis_manager
+    app.state.cache = cache
     app.state.login_rate_limiter = login_rate_limiter
     app.state.rate_limiters = rate_limiters
     app.state.email_service = email_service

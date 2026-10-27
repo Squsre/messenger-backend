@@ -9,6 +9,9 @@ SQLAlchemy==2.0.36
 alembic==1.14.0
 # PostgreSQL driver used by SQLAlchemy's postgresql+psycopg dialect.
 psycopg[binary]==3.3.6
+# Redis client (cache, shared rate limiting and ephemeral data). The package
+# includes both the thread-safe sync client and the asyncio client.
+redis==5.2.1
 # Authentication: Argon2id password hashing and JWT signing.
 argon2-cffi==23.1.0
 PyJWT==2.10.1

@@ -19,7 +19,8 @@ Usage::
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -28,6 +29,10 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 # impossible to configure an unsafe algorithm such as ``none`` or to trigger an
 # RSA/HMAC confusion attack.
 ALLOWED_JWT_ALGORITHMS: frozenset[str] = frozenset({"HS256", "HS384", "HS512"})
+
+# Redis transports. ``rediss`` is accepted for deployments that terminate TLS at
+# the Redis endpoint.
+ALLOWED_REDIS_SCHEMES: frozenset[str] = frozenset({"redis", "rediss"})
 
 # Email delivery backends. ``console`` is development-only.
 ALLOWED_EMAIL_BACKENDS: frozenset[str] = frozenset({"console", "smtp", "disabled"})
@@ -118,6 +123,56 @@ class Settings(DatabaseSettings):
     host: str = Field(default="127.0.0.1", description="Bind host for the ASGI server.")
     port: int = Field(default=8000, ge=1, le=65535, description="Bind port for the ASGI server.")
 
+    # --- Redis (cache, shared rate limiting and ephemeral data) ---
+    # PostgreSQL remains the source of truth. Redis holds only disposable state
+    # and a bounded public-profile cache. The password belongs in REDIS_URL (or
+    # a local, Git-ignored .env) and is never logged.
+    redis_url: str = Field(
+        default="redis://127.0.0.1:6379/0",
+        description="Redis URL (redis:// or rediss://).",
+    )
+    redis_socket_connect_timeout_seconds: float = Field(
+        default=1.0,
+        gt=0,
+        le=30,
+        description="Maximum time to establish a Redis connection.",
+    )
+    redis_socket_timeout_seconds: float = Field(
+        default=1.0,
+        gt=0,
+        le=30,
+        description="Maximum time to wait for a Redis command.",
+    )
+    redis_health_check_interval_seconds: int = Field(
+        default=30,
+        ge=0,
+        le=3600,
+        description="How often the client checks an idle pooled connection.",
+    )
+    redis_key_prefix: str = Field(
+        default="messenger",
+        min_length=1,
+        max_length=64,
+        description="Namespace prepended to every Redis key.",
+    )
+    cache_enabled: bool = Field(
+        default=True,
+        description="Enable the disposable public-profile cache.",
+    )
+    profile_cache_ttl_seconds: int = Field(
+        default=60,
+        ge=1,
+        le=86400,
+        description="Lifetime of a cached public profile.",
+    )
+    rate_limit_failure_policy: Literal["open", "closed"] = Field(
+        default="closed",
+        description=(
+            "Behaviour when Redis is unavailable for rate limiting: 'closed' "
+            "returns 503 (safer), 'open' allows the request."
+        ),
+    )
+
     # --- Authentication / JWT ---
     # No default on purpose: the key must be supplied through the environment.
     jwt_secret_key: SecretStr = Field(
@@ -134,10 +189,10 @@ class Settings(DatabaseSettings):
     jwt_issuer: str = Field(default="messenger-api", description="``iss`` claim of issued tokens.")
     jwt_audience: str = Field(default="messenger-api", description="``aud`` claim of issued tokens.")
 
-    # --- Login rate limiting (in-process, see app/core/rate_limit.py) ---
+    # --- Shared rate limiting (Redis-backed, see app/core/rate_limit.py) ---
     rate_limit_enabled: bool = Field(
         default=True,
-        description="Enable the in-process login rate limiter.",
+        description="Enable the Redis-backed shared rate limiter.",
     )
     login_rate_limit_attempts: int = Field(
         default=5,
@@ -344,6 +399,30 @@ class Settings(DatabaseSettings):
         if not path:
             raise ValueError("media_storage_path must not be empty")
         return path
+
+    @field_validator("redis_url")
+    @classmethod
+    def _validate_redis_url(cls, value: str) -> str:
+        url = value.strip()
+        if not url:
+            raise ValueError("redis_url must not be empty")
+        parsed = urlsplit(url)
+        if parsed.scheme not in ALLOWED_REDIS_SCHEMES:
+            allowed = ", ".join(sorted(ALLOWED_REDIS_SCHEMES))
+            raise ValueError(f"redis_url must use one of: {allowed}")
+        if not parsed.hostname:
+            raise ValueError("redis_url must include a host")
+        return url
+
+    @field_validator("redis_key_prefix")
+    @classmethod
+    def _validate_redis_key_prefix(cls, value: str) -> str:
+        prefix = value.strip().strip(":")
+        if not prefix:
+            raise ValueError("redis_key_prefix must not be empty")
+        if any(character.isspace() for character in prefix):
+            raise ValueError("redis_key_prefix must not contain whitespace")
+        return prefix
 
     @field_validator("jwt_secret_key")
     @classmethod

@@ -1,8 +1,8 @@
 # Messenger — Backend API
 
 Backend for the messenger project, built with **Python 3.11**, **FastAPI** and
-**SQLAlchemy 2.0** with **PostgreSQL** as the only supported database, plus
-**Alembic** for migrations and
+**SQLAlchemy 2.0** with **PostgreSQL** as the only supported database, **Redis**
+for disposable cache/rate-limit state, plus **Alembic** for migrations and
 **Argon2id + JWT** authentication.
 
 > Delivered so far:
@@ -24,6 +24,9 @@ Backend for the messenger project, built with **Python 3.11**, **FastAPI** and
 > **Stage 12** — PostgreSQL as the only supported database: `psycopg` driver,
 > a development `compose.yaml`, PostgreSQL-only settings and migrations,
 > credential-redacted logs, and a test suite that runs entirely on PostgreSQL.
+> **Stage 13** — Redis for a bounded public-profile cache, TTL-backed ephemeral
+> data, atomic shared rate limiting across workers, fail-open/fail-closed policy,
+> lifecycle-managed connections and PostgreSQL+Redis readiness checks.
 >
 > E2EE is still to come. Two-factor authentication and contact *requests* are
 > deliberately deferred and documented in the roadmap. Files are stored locally
@@ -41,7 +44,7 @@ messenger/
 │   │   ├── config.py            # pydantic-settings configuration
 │   │   ├── dependencies.py      # get_app_settings
 │   │   ├── errors.py            # AppError hierarchy + exception handlers
-│   │   ├── rate_limit.py        # in-process sliding-window limiter
+│   │   ├── rate_limit.py        # Redis-backed atomic sliding-window limiter
 │   │   └── security.py          # Argon2id, JWT, username/avatar policy, opaque tokens
 │   ├── db/
 │   │   ├── base.py              # declarative Base, naming convention, mixins
@@ -69,6 +72,9 @@ messenger/
 │   │   ├── email.py             # EmailService: smtp / console / disabled
 │   │   ├── contact.py           # contacts, blocks, user search queries
 │   │   ├── auth.py              # shared token -> user resolution (HTTP + WebSocket)
+│   │   ├── redis.py             # one process-wide Redis connection + safe URL
+│   │   ├── cache.py             # fail-open get/set/delete + JSON helpers
+│   │   ├── profile_cache.py     # safe public-profile cache + invalidation
 │   │   ├── realtime.py          # in-process WebSocket connection registry
 │   │   ├── chat.py              # conversations, membership, messages, read watermarks
 │   │   ├── group.py             # groups, roles, invitations, receipts, discovery
@@ -80,7 +86,7 @@ messenger/
 │   │   └── v1/
 │   │       ├── router.py        # aggregates all v1 routers
 │   │       └── endpoints/
-│   │           ├── health.py    # GET  /api/v1/health
+│   │           ├── health.py    # GET  /api/v1/health and /health/ready
 │   │           ├── auth.py      # /api/v1/auth/{register,login,me,logout}
 │   │           ├── account.py   # /api/v1/auth/{email,password,sessions,logout-all}
 │   │           ├── users.py     # /api/v1/users/{me,search,{username}}
@@ -115,7 +121,8 @@ messenger/
 ├── tests/
 │   ├── conftest.py              # fixtures + register/login and email helpers
 │   ├── test_app.py              # startup, docs, wiring
-│   ├── test_health.py           # health endpoint
+│   ├── test_health.py           # liveness endpoint
+│   ├── test_redis.py            # cache, TTL, invalidation, shared rate limits
 │   ├── test_database.py         # engine, sessions, get_db dependency
 │   ├── test_migrations.py       # real `alembic upgrade/downgrade` + data backfill
 │   ├── test_security.py         # hashing, password policy, JWT
@@ -147,7 +154,7 @@ messenger/
 │   ├── test_group_realtime.py  # group event fan-out and WebSocket authorization
 │   └── test_postgres.py        # PostgreSQL connection/migration/constraint tests
 ├── alembic.ini
-├── compose.yaml               # PostgreSQL 16 development service (healthcheck + volume)
+├── compose.yaml               # PostgreSQL 16 + Redis 7 development services
 ├── .env.example
 ├── .gitignore
 ├── pytest.ini
@@ -167,11 +174,11 @@ python -m pip install -r requirements-dev.txt
 # place instead of overwriting your local values.
 if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 
-# Edit .env: set a strong JWT_SECRET_KEY and a matching POSTGRES_PASSWORD.
-# The DATABASE_URL password must match POSTGRES_PASSWORD.
-docker compose up -d postgres
+# Edit .env: set a strong JWT_SECRET_KEY, POSTGRES_PASSWORD and REDIS_PASSWORD.
+# DATABASE_URL and REDIS_URL must match those passwords.
+docker compose up -d postgres redis
 
-# Wait until the container reports healthy:
+# Wait until both containers report healthy:
 docker compose ps
 
 # Create/update the PostgreSQL schema:
@@ -203,23 +210,30 @@ database is created automatically if it does not exist.
 startup does not update the existing role or database; update PostgreSQL
 manually after a backup, or deliberately use a new volume.
 
-### Start PostgreSQL for development
+### Start PostgreSQL and Redis for development
 
-`compose.yaml` runs only PostgreSQL (no Redis, MinIO, Celery or API container):
+`compose.yaml` runs PostgreSQL and Redis only (no MinIO, Celery or API
+container):
 
 ```powershell
 # .env is read automatically by Docker Compose
-docker compose up -d postgres
+docker compose up -d postgres redis
 docker compose ps
-docker compose logs -f postgres
+docker compose logs -f postgres redis
 ```
 
-It uses `postgres:16-alpine`, a named volume (`messenger_postgres_data`), the
-`POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_PORT`
-variables from `.env`, and a `pg_isready` healthcheck. Compose refuses to start
-if `POSTGRES_PASSWORD` is unset. `docker compose down` stops the container and
-keeps the volume; `docker compose down -v` deletes the database volume and must
-be used deliberately.
+PostgreSQL uses `postgres:16-alpine`, a named volume
+(`messenger_postgres_data`), the `POSTGRES_DB` / `POSTGRES_USER` /
+`POSTGRES_PASSWORD` / `POSTGRES_PORT` variables from `.env`, and a
+`pg_isready` healthcheck. Compose refuses to start if `POSTGRES_PASSWORD` or
+`REDIS_PASSWORD` is unset. `docker compose down` stops the containers and keeps
+the database volume; `docker compose down -v` deletes the database volume and
+must be used deliberately.
+
+Redis uses `redis:7-alpine`, a password from `REDIS_PASSWORD`, a 256 MB
+`allkeys-lru` ceiling, persistence disabled (it only holds disposable data) and
+an authenticated `redis-cli ping` healthcheck. It deliberately has no volume:
+losing cache entries or rate-limit counters is harmless.
 
 Set the matching SQLAlchemy URL in `.env`:
 
@@ -235,6 +249,26 @@ URL-encode special characters in a password. `postgres://` and
 `postgresql://` shorthands are normalised to `postgresql+psycopg://` by the
 settings layer. The real password belongs only in the Git-ignored `.env`;
 `.env.example` contains a clearly marked development placeholder.
+
+### Redis (cache, shared throttling and ephemeral data)
+
+Redis is **not** a source of truth. PostgreSQL remains authoritative; Redis
+stores only a bounded public-profile cache and the shared rate-limit counters.
+The application creates one process-wide thread-safe Redis client (and its
+connection pool), pings it during startup, and closes it during shutdown.
+
+Set both URLs in `.env` (the password is URL-encoded):
+
+```dotenv
+REDIS_PASSWORD=your-local-password
+REDIS_PORT=6379
+REDIS_URL=redis://:your-local-password@127.0.0.1:6379/0
+TEST_REDIS_URL=redis://:your-local-password@127.0.0.1:6379/15
+```
+
+The test suite refuses to run if `TEST_REDIS_URL` points at the same Redis
+database as `REDIS_URL`. It gives every test a unique `REDIS_KEY_PREFIX` and
+deletes only that prefix; it never calls `FLUSHDB` or touches development keys.
 
 ### Migrations (Alembic)
 
@@ -259,7 +293,7 @@ settings layer. The real password belongs only in the Git-ignored `.env`;
 ```
 
 The database URL is read from `DATABASE_URL` (via `.env`) and must be a
-PostgreSQL URL. Stage 12 adds no revision; the schema is still the phase-11
+PostgreSQL URL. Stage 13 adds no revision; the schema is still the phase-11
 head, now verified from an empty PostgreSQL database through every upgrade and
 back down again.
 
@@ -454,22 +488,50 @@ expires. This project therefore implements a **database-backed denylist**
 
 **Trade-offs (documented honestly):** each authenticated request performs one
 extra indexed lookup; the denylist is only as available as the database; and a
-shared database is required once the API runs on several hosts. A Redis/`jti`
-cache would be the natural next step, but is intentionally out of scope here.
+shared database is required once the API runs on several hosts. Redis is now
+available for cache and throttling, but caching revoked `jti` values (and the
+invalidation edge cases that come with it) remains a separate follow-up.
 
-### Login rate limiting
+### Shared rate limiting
 
-`POST /login` is throttled by an **in-process sliding-window limiter**
-(`app/core/rate_limit.py`), keyed by **client IP** *and* **target account**, so
-neither one host guessing many accounts nor many hosts guessing one account goes
-unnoticed. Limits: 5 attempts / 60 s (`LOGIN_RATE_LIMIT_ATTEMPTS`,
-`LOGIN_RATE_LIMIT_WINDOW_SECONDS`). Exceeding a limit returns `429` with a
-`Retry-After` header.
+All throttled endpoints use one Redis-backed sliding-window implementation
+(`app/core/rate_limit.py`). `POST /login` is keyed by **client IP** *and*
+**target account**, so neither one host guessing many accounts nor many hosts
+guessing one account goes unnoticed. Limits: 5 attempts / 60 s
+(`LOGIN_RATE_LIMIT_ATTEMPTS`, `LOGIN_RATE_LIMIT_WINDOW_SECONDS`). Exceeding a
+limit returns `429` with a `Retry-After` header.
 
-**Limitation:** state is per process, so with multiple workers each enforces its
-own bucket, and counters reset on restart. A shared store (Redis) is the
-follow-up once the service scales horizontally. Set `RATE_LIMIT_ENABLED=false`
-to disable it (e.g. behind an external gateway that already throttles).
+The prune/count/insert/expire operation runs as a single Lua script, so counters
+are atomic and shared by every worker and host using the same Redis database.
+Redis's clock is used, avoiding process clock skew. Counters expire with the
+window and are disposable. Account and address identifiers are hashed before
+they become key material, so raw e-mail addresses and IPs are not stored in
+Redis.
+
+If Redis cannot answer, `RATE_LIMIT_FAILURE_POLICY` decides the outcome:
+
+* `closed` (default, safer): return `503 service_unavailable` instead of
+  silently allowing unlimited login attempts;
+* `open`: allow the request, favouring availability over throttling.
+
+WebSocket message throttling follows the same policy: with `closed`, a Redis
+outage rejects the message with a `service_unavailable` error but keeps the
+socket open; with `open`, the message is allowed.
+
+Set `RATE_LIMIT_ENABLED=false` to disable throttling entirely (for example
+behind an external gateway that already enforces it). The cache is always
+fail-open: a Redis outage only causes a cache miss.
+
+### Public-profile cache
+
+`GET /users/{username}` may serve a cached public profile for
+`PROFILE_CACHE_TTL_SECONDS`. Only profiles with `profile_visibility=public` and
+`show_last_seen=true` are cached; private/contacts-only profiles and hidden
+last-seen values never enter Redis. PostgreSQL remains authoritative for
+existence, active state, visibility and blocks, so those checks run before a
+cached entry is used. Profile edits invalidate the current key, and a username
+change invalidates both the old and the new key. Tokens, passwords, email
+addresses, account ids and private profile fields are never cached.
 
 ### Security notes
 
@@ -1334,9 +1396,9 @@ connected elsewhere see it when they refresh history. The same applies to
 history/list refresh is correct), and "last socket closed" is only known within
 one worker. The pending caps apply per worker, so the effective global limit
 multiplies with the worker count. Running a single worker is fine for development
-and the current deployment. Scaling out needs a shared pub/sub layer (Redis
-pub/sub or PostgreSQL `LISTEN/NOTIFY`) and shared counters; **Redis is
-deliberately not added in this phase**.
+and the current deployment. Rate-limit counters are already shared through Redis;
+WebSocket fan-out still needs a shared pub/sub layer (Redis pub/sub or
+PostgreSQL `LISTEN/NOTIFY`), which is deliberately out of scope for this phase.
 
 The per-peer pending cap uses `request.client.host`. Behind a reverse proxy that
 is the proxy address unless the proxy is configured to preserve the real client,
@@ -1354,7 +1416,8 @@ uvicorn app.main:app --reload
 | http://127.0.0.1:8000/docs           | Swagger UI           |
 | http://127.0.0.1:8000/redoc          | ReDoc                |
 | http://127.0.0.1:8000/openapi.json   | OpenAPI schema       |
-| http://127.0.0.1:8000/api/v1/health  | Health check         |
+| http://127.0.0.1:8000/api/v1/health  | Liveness check       |
+| http://127.0.0.1:8000/api/v1/health/ready | PostgreSQL + Redis readiness |
 | http://127.0.0.1:8000/api/v1/auth/*  | Authentication       |
 
 Example health response:
@@ -1368,23 +1431,42 @@ Example health response:
 }
 ```
 
+Readiness (`/api/v1/health/ready`) checks both dependencies and returns `200` or
+`503`:
+
+```json
+{
+  "status": "ok",
+  "checks": {"database": "ok", "redis": "ok"}
+}
+```
+
 ## Run the tests
 
 ```powershell
+# PostgreSQL and Redis must be healthy first.
+docker compose up -d postgres redis
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-Tests run against PostgreSQL. Each test gets a unique short-lived schema in the
-database named by `TEST_DATABASE_URL` (normally `messenger_test`), which is
-dropped afterwards. The development database named by `DATABASE_URL` is never
-used by the suite. Media tests also point `MEDIA_STORAGE_PATH` at a per-test
-temporary directory, so the suite never reads or writes real user uploads.
+Tests run against isolated PostgreSQL and Redis resources. Each test gets a
+unique short-lived PostgreSQL schema in the database named by
+`TEST_DATABASE_URL` (normally `messenger_test`), which is dropped afterwards. The
+development database named by `DATABASE_URL` is never used by the suite. Media
+tests also point `MEDIA_STORAGE_PATH` at a per-test temporary directory, so the
+suite never reads or writes real user uploads.
 
 `TEST_DATABASE_URL` is required and must point at a **separate** disposable
 database; the test fixtures refuse to run if it matches `DATABASE_URL`. If the
 test database does not exist, the suite creates it automatically. The
 PostgreSQL integration tests in `tests/test_postgres.py` are part of the normal
 suite and are not skipped.
+
+Redis tests use `TEST_REDIS_URL`, which must point at a different Redis database
+from `REDIS_URL` (database 15 by default). Every test receives a unique key
+prefix and the fixture deletes only that prefix afterwards; no test calls
+`FLUSHDB`. Redis must be running (`docker compose up -d redis`) or the suite
+stops with a clear configuration error.
 
 The tests cover the psycopg connection, `Base.metadata.create_all`, a full
 `alembic upgrade head` from empty, `alembic check`-equivalent metadata
@@ -1457,12 +1539,21 @@ variables or the local `.env` file. See `.env.example` for every supported key:
 | `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_PORT` | *(compose values)* | PostgreSQL container settings; must match `DATABASE_URL`. |
 | `TEST_DATABASE_URL` | *(required for tests)* | Separate disposable PostgreSQL database for the test suite. |
 | `DB_ECHO`        | `false`               | Log every SQL statement.                       |
+| `REDIS_URL`      | `redis://127.0.0.1:6379/0` | Redis URL; use `rediss://` for TLS.     |
+| `TEST_REDIS_URL` | *(required for tests)* | Separate Redis database/namespace for tests. |
+| `REDIS_PASSWORD` / `REDIS_PORT` | *(compose values)* | Redis container password and host port. |
+| `REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS` / `REDIS_SOCKET_TIMEOUT_SECONDS` | `1` / `1` | Redis connection/command timeouts. |
+| `REDIS_HEALTH_CHECK_INTERVAL_SECONDS` | `30` | Idle pooled-connection health check. |
+| `REDIS_KEY_PREFIX` | `messenger`          | Namespace for every Redis key.                 |
+| `CACHE_ENABLED`  | `true`                | Enable the disposable public-profile cache.    |
+| `PROFILE_CACHE_TTL_SECONDS` | `60`       | Public-profile cache lifetime.                 |
+| `RATE_LIMIT_FAILURE_POLICY` | `closed` | `closed` = 503 on Redis outage; `open` = allow. |
 | `JWT_SECRET_KEY` | *(required)*          | HMAC signing key. **No default** — the app will not start without it. |
 | `JWT_ALGORITHM`  | `HS256`               | `HS256` / `HS384` / `HS512` only.              |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | `15`     | Access-token lifetime (keep short).            |
 | `JWT_ISSUER`     | `messenger-api`       | `iss` claim.                                   |
 | `JWT_AUDIENCE`   | `messenger-api`       | `aud` claim.                                   |
-| `RATE_LIMIT_ENABLED` | `true`            | Enable the login throttle.                     |
+| `RATE_LIMIT_ENABLED` | `true`            | Enable shared Redis-backed throttling.         |
 | `LOGIN_RATE_LIMIT_ATTEMPTS` | `5`      | Login attempts per window and key.             |
 | `LOGIN_RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate-limit window in seconds.                |
 | `PUBLIC_BASE_URL` | `http://localhost:8000` | Base URL used to build emailed links.     |
@@ -1529,9 +1620,9 @@ Unexpected failures are normalised to a consistent JSON envelope:
 Channels/broadcast lists, shared object storage (MinIO/S3), and E2EE are planned
 for later stages, and realtime fan-out needs a shared pub/sub store to run in
 more than one process. PostgreSQL operational hardening (backups, CI migration
-checks) and containerizing the API are follow-up work. When the service scales
-horizontally, move the rate limiters, the token denylist and the connection
-registry to a shared store (for example Redis).
+checks) and containerizing the API are follow-up work. Rate limiting and the
+public-profile cache already use Redis; the token denylist and WebSocket
+connection registry still need a shared-store design for multi-process fan-out.
 
 ### Known limitations in this phase
 
@@ -1544,13 +1635,14 @@ registry to a shared store (for example Redis).
   former local file database; this phase removed that file because its data was
   not needed. For a real deployment, take and verify backups before any schema
   change.
-* **Rate limiting is per process.** Each uvicorn worker (and each restarted
-  process) keeps its own counters, so the effective budget multiplies with the
-  worker count. It stops casual abuse, not a distributed attack; a shared store
-  is the follow-up.
+* **Rate limiting depends on Redis.** Counters are shared and atomic across
+  workers, but a Redis outage follows `RATE_LIMIT_FAILURE_POLICY` (503 by
+  default, or fail-open when explicitly configured). Redis itself is a single
+  development container with no replication or failover recipe yet.
 * **The denylist adds one query per authenticated request** (`token_blocklist`),
   and a session lookup adds another. Both are indexed and cheap, but they are
-  not free; a cache belongs on the shared-store work item.
+  not free; caching the denylist is still a follow-up. The public-profile cache
+  is bounded and invalidated, but a Redis outage simply falls back to PostgreSQL.
 * **`request.client.host` is the proxy address** when the API runs behind one,
   which affects the stored session IP and the IP-keyed rate limits. Configure the
   proxy to overwrite `X-Forwarded-For` and read it explicitly before production.
@@ -1563,9 +1655,8 @@ registry to a shared store (for example Redis).
 * **Realtime fan-out is single-process.** The WebSocket registry and the
   unauthenticated-socket counters live in one process; with several workers a
   client only receives events produced by the worker it is connected to, and the
-  pending caps multiply per worker. A shared pub/sub layer and shared counters
-  are the follow-up (see the realtime section). Rate limits remain per process
-  for the same reason.
+  pending caps multiply per worker. A shared pub/sub layer is the follow-up (see
+  the realtime section); rate-limit counters are already shared through Redis.
 * **WebSocket revocation is bounded, not instantaneous.** An open socket checks
   its token every `WS_TOKEN_RECHECK_INTERVAL_SECONDS` (default 30 s) and on every
   chat message. Logout, `token_version`, expiry and deactivation therefore take

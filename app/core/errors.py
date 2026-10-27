@@ -94,6 +94,13 @@ class UnsupportedMediaTypeError(AppError):
     code = "unsupported_media_type"
 
 
+class ServiceUnavailableError(AppError):
+    """Raised when a required dependency cannot answer safely."""
+
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    code = "service_unavailable"
+
+
 class RateLimitError(AppError):
     """Raised when a client exceeds an allowed request rate."""
 

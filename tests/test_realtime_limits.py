@@ -8,6 +8,7 @@ from contextlib import ExitStack
 import pytest
 from fastapi import WebSocketDisconnect
 
+from app.core.rate_limit import RateLimitUnavailable
 from app.services.realtime import ConnectionManager
 from tests._realtime import (
     WS_URL,
@@ -162,6 +163,30 @@ def test_message_rate_limit_is_enforced_per_account(client, api, test_settings) 
         f"/api/v1/conversations/{conversation}/messages", headers=alice_headers
     ).json()
     assert history["total"] == 2
+
+
+def test_message_rate_limit_backend_failure_is_reported(
+    client, api, monkeypatch
+) -> None:
+    _, alice_headers = api.create_user("alice@example.com")
+    api.register("bob@example.com")
+    conversation = conversation_between(client, alice_headers, "bob")
+    token = api.login("alice@example.com")
+
+    def unavailable(_key: str):
+        raise RateLimitUnavailable("ws")
+
+    monkeypatch.setattr(client.app.state.rate_limiters["ws"], "check", unavailable)
+
+    with open_socket(client, token) as alice:
+        alice.send_json(message_frame(conversation, "not delivered"))
+        event = alice.receive_json()
+        assert event["type"] == "error"
+        assert event["code"] == "service_unavailable"
+
+        # The socket remains usable even though the message was rejected.
+        alice.send_json({"type": "ping"})
+        assert alice.receive_json()["type"] == "pong"
 
 
 def test_heartbeat_pings_and_closes_an_idle_socket(client, api, test_settings) -> None:

@@ -7,8 +7,11 @@ import re
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
+import redis
 from dotenv import dotenv_values
+from redis.exceptions import RedisError
 
 # The JWT signing key is environment-only (no usable default in Settings), and
 # ``import app.main`` builds the app eagerly. Provide a test key before that
@@ -55,6 +58,31 @@ TEST_DATABASE_URL = _configured_database_url("TEST_DATABASE_URL")
 _APP_DATABASE_URL = _configured_database_url("DATABASE_URL")
 
 
+def _configured_redis_url(name: str) -> str:
+    """Read a Redis URL from the process environment or the local .env."""
+    value = os.getenv(name) or _ENV_VALUES.get(name, "")
+    if not value:
+        if name == "TEST_REDIS_URL":
+            base = os.getenv("REDIS_URL") or _ENV_VALUES.get("REDIS_URL", "")
+            if base:
+                # Default the disposable tests to database 15 on the same server.
+                parsed = urlsplit(base)
+                value = urlunsplit(parsed._replace(path="/15"))
+        if not value:
+            raise pytest.UsageError(
+                f"{name} is required. Point it at a disposable Redis database "
+                "(for example database 15) before running the test suite."
+            )
+    parsed = urlsplit(value.strip())
+    if parsed.scheme not in {"redis", "rediss"} or not parsed.hostname:
+        raise pytest.UsageError(f"{name} must be a redis:// or rediss:// URL")
+    return value.strip()
+
+
+TEST_REDIS_URL = _configured_redis_url("TEST_REDIS_URL")
+_APP_REDIS_URL = _configured_redis_url("REDIS_URL")
+
+
 def _same_server_database(left: str, right: str) -> bool:
     left_url = make_url(left)
     right_url = make_url(right)
@@ -65,10 +93,26 @@ def _same_server_database(left: str, right: str) -> bool:
     )
 
 
+def _same_redis_database(left: str, right: str) -> bool:
+    left_url = urlsplit(left)
+    right_url = urlsplit(right)
+    return (
+        left_url.hostname == right_url.hostname
+        and (left_url.port or 6379) == (right_url.port or 6379)
+        and (left_url.path or "/0") == (right_url.path or "/0")
+    )
+
+
 if _same_server_database(TEST_DATABASE_URL, _APP_DATABASE_URL):
     raise pytest.UsageError(
         "TEST_DATABASE_URL must point at a separate database from DATABASE_URL; "
         "the test suite creates and drops schemas and must not touch development data."
+    )
+
+if _same_redis_database(TEST_REDIS_URL, _APP_REDIS_URL):
+    raise pytest.UsageError(
+        "TEST_REDIS_URL must point at a separate Redis database from REDIS_URL; "
+        "the test suite only deletes its own key prefix, but isolation is required."
     )
 
 
@@ -197,6 +241,49 @@ def test_database_url() -> str:
     return TEST_DATABASE_URL
 
 
+@pytest.fixture(scope="session")
+def test_redis_url() -> str:
+    """Ensure the disposable Redis test database is reachable."""
+    client = redis.Redis.from_url(
+        TEST_REDIS_URL,
+        socket_connect_timeout=1,
+        socket_timeout=1,
+    )
+    try:
+        client.ping()
+    except RedisError as exc:
+        raise pytest.UsageError(
+            "TEST_REDIS_URL is not reachable. Start Redis with "
+            "'docker compose up -d redis' before running the test suite."
+        ) from exc
+    finally:
+        client.close()
+    return TEST_REDIS_URL
+
+
+@pytest.fixture()
+def redis_namespace(test_redis_url: str) -> Iterator[str]:
+    """A unique Redis key prefix, removed after the test.
+
+    Tests share one disposable Redis database but never see each other's keys.
+    The cleanup only deletes this prefix; it never runs ``FLUSHDB`` and therefore
+    cannot touch another application or the development namespace.
+    """
+    prefix = f"messenger-test-{uuid.uuid4().hex}"
+    yield prefix
+
+    client = redis.Redis.from_url(
+        TEST_REDIS_URL,
+        socket_connect_timeout=1,
+        socket_timeout=1,
+    )
+    try:
+        for key in client.scan_iter(match=f"{prefix}:*", count=500):
+            client.delete(key)
+    finally:
+        client.close()
+
+
 @pytest.fixture()
 def db_url(test_database_url: str) -> Iterator[str]:
     """Create an isolated PostgreSQL schema for a single test.
@@ -223,7 +310,7 @@ def db_url(test_database_url: str) -> Iterator[str]:
 
 
 @pytest.fixture()
-def test_settings(db_url: str, tmp_path) -> Settings:
+def test_settings(db_url: str, redis_namespace: str, tmp_path) -> Settings:
     """Deterministic settings used by the test-suite.
 
     The database URL points at a throw-away PostgreSQL schema so tests never
@@ -243,6 +330,11 @@ def test_settings(db_url: str, tmp_path) -> Settings:
         api_v1_prefix="/api/v1",
         cors_origins=["http://localhost:3000"],
         database_url=db_url,
+        redis_url=TEST_REDIS_URL,
+        redis_key_prefix=redis_namespace,
+        cache_enabled=True,
+        profile_cache_ttl_seconds=60,
+        rate_limit_failure_policy="closed",
         jwt_secret_key=TEST_JWT_SECRET,
         access_token_expire_minutes=15,
         rate_limit_enabled=True,
@@ -267,7 +359,8 @@ def app(test_settings: Settings):
     application = create_app(settings=test_settings)
     Base.metadata.create_all(bind=application.state.database.engine)
     yield application
-    # Release pooled connections before the schema is dropped.
+    # Release pooled connections before the schema and namespace are dropped.
+    application.state.redis_manager.close()
     application.state.database.dispose()
 
 

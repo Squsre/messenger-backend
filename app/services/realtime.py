@@ -5,9 +5,9 @@ Scope and limits
 This registry lives in **one process**. It is enough for a single uvicorn
 worker and for the current deployment, but it does not coordinate across
 workers or hosts: with more than one process, a message sent to worker A is
-only fanned out to sockets held by worker A. A shared pub/sub layer (Redis or
-similar) is the documented follow-up; Redis is deliberately **not** added in
-this phase.
+only fanned out to sockets held by worker A. Redis is available for cache and
+shared rate limiting, but a shared WebSocket pub/sub layer is deliberately still
+a follow-up and is not part of this phase.
 
 Invariants
 ----------

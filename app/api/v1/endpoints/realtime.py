@@ -82,6 +82,7 @@ from starlette.websockets import WebSocketState
 
 from app.core.config import Settings
 from app.core.errors import AppError, ForbiddenError, UnauthorizedError
+from app.core.rate_limit import RateLimitUnavailable
 from app.db.models import ConversationKind, User
 from app.db.session import Database
 from app.schemas.chat import build_message
@@ -288,7 +289,7 @@ def _check_rate_limit(websocket: WebSocket, settings: Settings, user_id: int) ->
     if limiter is None:
         return 0
 
-    allowed, wait = limiter.check(f"ws:user:{user_id}")
+    allowed, wait = limiter.check(f"user:{user_id}")
     if allowed:
         return 0
     return max(1, math.ceil(wait))
@@ -343,7 +344,21 @@ async def _dispatch(
         )
         return
 
-    retry_after = _check_rate_limit(websocket, settings, connection.user_id)
+    try:
+        retry_after = _check_rate_limit(websocket, settings, connection.user_id)
+    except RateLimitUnavailable:
+        # Fail-closed for the message, but keep the socket usable. A Redis
+        # outage must not turn into an unhandled task failure or a silent
+        # bypass of the per-account message budget.
+        await _send_error(
+            manager,
+            connection,
+            "service_unavailable",
+            "Message throttling is temporarily unavailable. Please retry.",
+            client_message_id=frame.client_message_id,
+        )
+        return
+
     if retry_after:
         await _send_error(
             manager,

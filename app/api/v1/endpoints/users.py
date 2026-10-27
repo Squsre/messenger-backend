@@ -25,7 +25,7 @@ from app.api import deps
 from app.core.config import Settings
 from app.core.dependencies import get_app_settings
 from app.core.errors import BadRequestError, NotFoundError
-from app.db.models import User
+from app.db.models import ProfileVisibility, User
 from app.db.session import get_db
 from app.schemas.user import (
     PrivacySettingsUpdate,
@@ -37,10 +37,16 @@ from app.schemas.user import (
     build_public_profile,
 )
 from app.services import contact as contact_service
+from app.services.cache import CacheService
 from app.services.profile import (
     can_view_profile,
     update_profile,
     visible_last_seen,
+)
+from app.services.profile_cache import (
+    cache_public_profile,
+    get_cached_public_profile,
+    invalidate_public_profile,
 )
 from app.services.user import get_user_by_username
 from app.services.user import normalize_username
@@ -146,10 +152,15 @@ def update_my_profile(
     payload: ProfileUpdate,
     current_user: User = Depends(deps.get_current_active_user),
     db: Session = Depends(get_db),
+    cache: CacheService = Depends(deps.get_cache),
 ) -> UserPrivate:
     """Apply the allow-listed changes to the caller's profile."""
+    previous_username = current_user.username
     changes = payload.model_dump(exclude_unset=True)
     update_profile(db, current_user, changes)
+    # A username change moves the public cache key; always clear both sides.
+    invalidate_public_profile(cache, username=previous_username)
+    invalidate_public_profile(cache, username=current_user.username)
     return build_private_profile(current_user)
 
 
@@ -168,9 +179,11 @@ def update_my_privacy(
     payload: PrivacySettingsUpdate,
     current_user: User = Depends(deps.get_current_active_user),
     db: Session = Depends(get_db),
+    cache: CacheService = Depends(deps.get_cache),
 ) -> UserPrivate:
     """Apply the privacy subset of the profile."""
     update_profile(db, current_user, payload.model_dump(exclude_unset=True))
+    invalidate_public_profile(cache, username=current_user.username)
     return build_private_profile(current_user)
 
 
@@ -253,8 +266,16 @@ def read_user_profile(
     username: str,
     current_user: User = Depends(deps.get_current_active_user),
     db: Session = Depends(get_db),
+    cache: CacheService = Depends(deps.get_cache),
+    settings: Settings = Depends(get_app_settings),
 ) -> UserPublic:
-    """Return the public profile of ``username``."""
+    """Return the public profile of ``username``.
+
+    PostgreSQL remains authoritative for existence, active state, visibility and
+    blocks; those checks run before a cached entry is used. Only public profile
+    fields (never id, email, account state or tokens) are cached, and only when
+    the last-seen value is public.
+    """
     target = get_user_by_username(db, username)
     if target is None or not target.is_active:
         raise NotFoundError("User not found.")
@@ -262,7 +283,26 @@ def read_user_profile(
     if not can_view_profile(db, viewer=current_user, target=target):
         raise NotFoundError("User not found.")
 
-    return build_public_profile(
+    cached = get_cached_public_profile(cache, username=username)
+    if cached is not None:
+        if (
+            target.profile_visibility == ProfileVisibility.PUBLIC.value
+            and target.show_last_seen
+        ):
+            return cached
+        # The cached entry is from before a privacy change (for example an
+        # invalidation that failed during a Redis blip). Discard it rather than
+        # risk returning a hidden last-seen value.
+        invalidate_public_profile(cache, username=target.username)
+
+    profile = build_public_profile(
         target,
         last_seen=visible_last_seen(viewer=current_user, target=target),
     )
+    cache_public_profile(
+        cache,
+        user=target,
+        profile=profile,
+        ttl_seconds=settings.profile_cache_ttl_seconds,
+    )
+    return profile

@@ -66,11 +66,20 @@ def test_limiter_reset() -> None:
 # --- API --------------------------------------------------------------------
 
 
-def _build_app(db_url: str, *, attempts: int, enabled: bool = True):
+def _build_app(
+    db_url: str,
+    redis_url: str,
+    redis_namespace: str,
+    *,
+    attempts: int,
+    enabled: bool = True,
+):
     settings = Settings(
         app_env="test",
         jwt_secret_key="rate-limit-test-secret-0123456789abcdefghij",
         database_url=db_url,
+        redis_url=redis_url,
+        redis_key_prefix=redis_namespace,
         rate_limit_enabled=enabled,
         login_rate_limit_attempts=attempts,
         login_rate_limit_window_seconds=60,
@@ -80,8 +89,12 @@ def _build_app(db_url: str, *, attempts: int, enabled: bool = True):
     return application
 
 
-def test_login_is_rate_limited_by_client_ip(db_url: str) -> None:
-    app = _build_app(db_url, attempts=3)
+def test_login_is_rate_limited_by_client_ip(
+    db_url: str, test_redis_url: str, redis_namespace: str
+) -> None:
+    app = _build_app(
+        db_url, test_redis_url, redis_namespace, attempts=3
+    )
     with TestClient(app) as client:
         client.post(REGISTER_URL, json={"email": "user@example.com", "password": STRONG_PASSWORD})
 
@@ -98,16 +111,21 @@ def test_login_is_rate_limited_by_client_ip(db_url: str) -> None:
         assert blocked.json()["error"]["code"] == "rate_limited"
         assert int(blocked.headers["retry-after"]) >= 1
 
+    app.state.redis_manager.close()
     app.state.database.dispose()
 
 
-def test_rate_limit_is_shared_per_account_across_addresses(db_url: str) -> None:
+def test_rate_limit_is_shared_per_account_across_addresses(
+    db_url: str, test_redis_url: str, redis_namespace: str
+) -> None:
     """A distributed attempt on one account is throttled even from new IPs.
 
     Exercises the dependency directly: this Starlette version's ``TestClient``
     cannot vary the peer address, so we build requests with different clients.
     """
-    app = _build_app(db_url, attempts=3)
+    app = _build_app(
+        db_url, test_redis_url, redis_namespace, attempts=3
+    )
     settings = app.state.settings
     email = "user@example.com"
 
@@ -140,11 +158,16 @@ def test_rate_limit_is_shared_per_account_across_addresses(db_url: str) -> None:
     assert excinfo.value.status_code == 429
     assert excinfo.value.headers and "Retry-After" in excinfo.value.headers
 
+    app.state.redis_manager.close()
     app.state.database.dispose()
 
 
-def test_rate_limit_can_be_disabled(db_url: str) -> None:
-    app = _build_app(db_url, attempts=1, enabled=False)
+def test_rate_limit_can_be_disabled(
+    db_url: str, test_redis_url: str, redis_namespace: str
+) -> None:
+    app = _build_app(
+        db_url, test_redis_url, redis_namespace, attempts=1, enabled=False
+    )
     with TestClient(app) as client:
         client.post(REGISTER_URL, json={"email": "user@example.com", "password": STRONG_PASSWORD})
 
@@ -154,4 +177,5 @@ def test_rate_limit_can_be_disabled(db_url: str) -> None:
             )
             assert response.status_code == 401
 
+    app.state.redis_manager.close()
     app.state.database.dispose()

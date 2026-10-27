@@ -16,6 +16,16 @@ class HealthResponse(BaseModel):
     environment: str = Field(description="Deployment environment.", examples=["development"])
 
 
+class ReadinessResponse(BaseModel):
+    """Payload returned by ``GET /api/v1/health/ready``."""
+
+    status: Literal["ok", "degraded"] = Field(description="Overall readiness.")
+    checks: dict[str, Literal["ok", "error"]] = Field(
+        description="Per-dependency readiness results.",
+        examples=[{"database": "ok", "redis": "ok"}],
+    )
+
+
 class RootResponse(BaseModel):
     """Small banner returned by the API root."""
 

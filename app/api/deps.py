@@ -30,13 +30,23 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.core.dependencies import get_app_settings
-from app.core.errors import ForbiddenError, RateLimitError, UnauthorizedError
-from app.core.rate_limit import SlidingWindowRateLimiter
+from app.core.errors import (
+    ForbiddenError,
+    RateLimitError,
+    ServiceUnavailableError,
+    UnauthorizedError,
+)
+from app.core.rate_limit import (
+    RateLimitUnavailable,
+    RedisSlidingWindowRateLimiter,
+)
 from app.core.security import AccessTokenClaims, TokenError, decode_access_token
 from app.db.models import User
 from app.db.session import get_db
 from app.services.auth import resolve_user_from_claims
+from app.services.cache import CacheService
 from app.services.email import EmailService, build_email_service
+from app.services.redis import RedisManager
 from app.services.storage import StorageService
 from app.services.user import normalize_email
 
@@ -118,6 +128,22 @@ def get_storage(request: Request) -> StorageService:
     return storage
 
 
+def get_cache(request: Request) -> CacheService:
+    """Return the application's Redis-backed cache service."""
+    cache = getattr(request.app.state, "cache", None)
+    if cache is None:  # pragma: no cover - every app factory sets this
+        raise RuntimeError("cache is not configured")
+    return cache
+
+
+def get_redis(request: Request) -> RedisManager:
+    """Return the process-wide Redis connection manager."""
+    manager = getattr(request.app.state, "redis_manager", None)
+    if manager is None:  # pragma: no cover - every app factory sets this
+        raise RuntimeError("Redis is not configured")
+    return manager
+
+
 def get_client_ip(request: Request) -> str | None:
     """Best-effort client address.
 
@@ -131,18 +157,29 @@ def get_client_ip(request: Request) -> str | None:
 # --- rate limiting ----------------------------------------------------------
 
 
-def get_rate_limiter(request: Request, scope: str) -> SlidingWindowRateLimiter | None:
-    """Return the limiter registered for ``scope``, if any."""
+def get_rate_limiter(
+    request: Request, scope: str
+) -> RedisSlidingWindowRateLimiter | None:
+    """Return the shared limiter registered for ``scope``, if any."""
     registry = getattr(request.app.state, "rate_limiters", None) or {}
     return registry.get(scope)
 
 
+def _raise_if_backend_unavailable(exc: RateLimitUnavailable) -> None:
+    """Map a fail-closed Redis outage to a clear 503 instead of a fake 429."""
+    raise ServiceUnavailableError(
+        "Rate limiting is temporarily unavailable. Please try again later."
+    ) from exc
+
+
 def enforce_rate_limit(request: Request, settings: Settings, scope: str, *keys: str) -> None:
-    """Throttle a request against the limiter registered for ``scope``.
+    """Throttle a request against the shared limiter registered for ``scope``.
 
     Every key is checked and the longest wait wins (so a "per account" and a
     "per address" rule can be combined). Raises :class:`RateLimitError`
-    (429 + ``Retry-After``) when any key is exhausted.
+    (429 + ``Retry-After``) when any key is exhausted. A Redis outage is mapped
+    according to ``RATE_LIMIT_FAILURE_POLICY``: fail-closed returns 503,
+    fail-open allows the request.
     """
     if not settings.rate_limit_enabled:
         return
@@ -152,17 +189,21 @@ def enforce_rate_limit(request: Request, settings: Settings, scope: str, *keys: 
         return
 
     retry_after = 0.0
-    for key in keys:
-        allowed, wait = limiter.check(f"{scope}:{key}")
-        if not allowed:
-            retry_after = max(retry_after, wait)
+    try:
+        for key in keys:
+            # The limiter already namespaces keys by ``scope``.
+            allowed, wait = limiter.check(key)
+            if not allowed:
+                retry_after = max(retry_after, wait)
+    except RateLimitUnavailable as exc:
+        _raise_if_backend_unavailable(exc)
 
     if retry_after > 0:
         raise RateLimitError(retry_after=math.ceil(retry_after))
 
 
-def get_login_rate_limiter(request: Request) -> SlidingWindowRateLimiter | None:
-    """Return the application's login rate limiter, if one is configured."""
+def get_login_rate_limiter(request: Request) -> RedisSlidingWindowRateLimiter | None:
+    """Return the application's shared login rate limiter, if configured."""
     return getattr(request.app.state, "login_rate_limiter", None)
 
 
@@ -172,6 +213,7 @@ def enforce_login_rate_limit(request: Request, settings: Settings, email: str) -
     Two keys are checked so that neither a single host hammering many accounts
     nor a distributed attempt on one account goes unnoticed. Raises
     :class:`RateLimitError` (429 + ``Retry-After``) once a limit is exceeded.
+    Redis failures follow the same documented fail policy as other scopes.
     """
     if not settings.rate_limit_enabled:
         return
@@ -184,10 +226,13 @@ def enforce_login_rate_limit(request: Request, settings: Settings, email: str) -
     keys = (f"ip:{client_host}", f"email:{normalize_email(email)}")
 
     retry_after = 0.0
-    for key in keys:
-        allowed, wait = limiter.check(key)
-        if not allowed:
-            retry_after = max(retry_after, wait)
+    try:
+        for key in keys:
+            allowed, wait = limiter.check(key)
+            if not allowed:
+                retry_after = max(retry_after, wait)
+    except RateLimitUnavailable as exc:
+        _raise_if_backend_unavailable(exc)
 
     if retry_after > 0:
         raise RateLimitError(retry_after=math.ceil(retry_after))
