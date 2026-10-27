@@ -30,6 +30,10 @@ class MediaRead(BaseModel):
     status: MediaStatus = Field(
         description="Processing state; synchronous uploads are ready immediately."
     )
+    checksum_sha256: str | None = Field(
+        default=None,
+        description="SHA-256 of the accepted bytes, when recorded.",
+    )
     message_id: int | None = Field(
         default=None,
         description="Message this file is attached to, or null while unattached.",
@@ -41,6 +45,17 @@ class MediaBatchRead(BaseModel):
     """Result of a multi-file upload (1..MEDIA_MAX_FILES_PER_REQUEST files)."""
 
     items: list[MediaRead]
+
+
+class MediaAccessUrlRead(BaseModel):
+    """A short-lived direct download URL issued after authorization."""
+
+    media_id: str = Field(description="Opaque media id the URL belongs to.")
+    url: str = Field(description="Presigned object-storage URL; do not log or cache.")
+    expires_in_seconds: int = Field(
+        ge=1,
+        description="Seconds until the URL expires.",
+    )
 
 
 class AttachMediaRequest(BaseModel):
@@ -67,6 +82,7 @@ def build_media(media: Media, *, uploader_username: str) -> MediaRead:
         width=media.width,
         height=media.height,
         status=media.status,  # type: ignore[arg-type]
+        checksum_sha256=media.checksum_sha256,
         message_id=media.message_id,
         created_at=media.created_at,
     )

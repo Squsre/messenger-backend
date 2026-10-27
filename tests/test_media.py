@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -41,7 +42,7 @@ def _stored_files(app) -> list[Path]:
 
 
 def test_upload_png_returns_metadata_and_serves_authenticated_content(
-    client, api, app
+    client, api, app, db_session
 ) -> None:
     conversation_id, alice_headers, bob_headers = _pair(client, api)
 
@@ -63,7 +64,14 @@ def test_upload_png_returns_metadata_and_serves_authenticated_content(
     assert (item["width"], item["height"]) == (1, 1)
     assert item["status"] == "ready"
     assert item["message_id"] is None
+    assert item["checksum_sha256"] == hashlib.sha256(PNG_BYTES).hexdigest()
     assert "storage_key" not in item
+
+    row = db_session.execute(
+        select(Media).where(Media.public_id == item["id"])
+    ).scalar_one()
+    assert row.storage_backend == "local"
+    assert row.checksum_sha256 == hashlib.sha256(PNG_BYTES).hexdigest()
 
     stored = _stored_files(app)
     assert len(stored) == 1
@@ -233,6 +241,16 @@ def test_openapi_documents_the_multipart_upload(client) -> None:
     media_schema = request_body["content"]["multipart/form-data"]["schema"]
     assert media_schema["properties"]["files"]["type"] == "array"
     assert media_schema["required"] == ["files"]
+
+
+def test_local_storage_does_not_issue_direct_urls(client, api) -> None:
+    conversation_id, alice_headers, _ = _pair(client, api)
+    item = upload_one(client, alice_headers, conversation_id)
+
+    response = client.get(f"/api/v1/media/{item['id']}/url", headers=alice_headers)
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "conflict"
 
 
 def test_upload_requires_authentication(client, api) -> None:

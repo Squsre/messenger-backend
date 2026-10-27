@@ -10,7 +10,7 @@ services:
       # No usable default: set this in your local, Git-ignored .env file.
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -39,7 +39,7 @@ services:
       - --maxmemory-policy
       - allkeys-lru
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     healthcheck:
       test:
         [
@@ -51,6 +51,131 @@ services:
       retries: 10
       start_period: 5s
 
+  minio:
+    # Pinned by digest: the server and mc releases are reproducible.
+    image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+    command: server /data --console-address ":9001"
+    ports:
+      # Only development ports are published, and only on loopback.
+      - "127.0.0.1:${MINIO_API_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS --max-time 3 http://127.0.0.1:9000/minio/health/live",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  minio-init:
+    # One-shot, idempotent bucket/policy/user initialization. The application
+    # never receives the MinIO root credentials.
+    image: minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:?set MINIO_ACCESS_KEY in .env}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?set MINIO_SECRET_KEY in .env}
+      MINIO_BUCKET: ${MINIO_BUCKET:-messenger-media}
+    volumes:
+      - ./docker/minio/init.sh:/init.sh:ro
+    entrypoint: ["/bin/sh", "/init.sh"]
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: messenger-backend:local
+    init: true
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Container-to-container addresses use Compose service names, never the
+      # host's localhost.
+      HOST: 0.0.0.0
+      PORT: "8000"
+      UVICORN_WORKERS: ${UVICORN_WORKERS:-1}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-messenger}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-messenger}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379/0
+      MEDIA_STORAGE_BACKEND: minio
+      MEDIA_STORAGE_PATH: /app/var/media
+      MINIO_ENDPOINT: minio:9000
+      # Signed URLs must be reachable from the client, not from the container.
+      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-127.0.0.1:9000}
+      MINIO_AUTO_CREATE_BUCKET: "false"
+      # .env is shared with the MinIO server/initializer. Clear the root
+      # credentials here so the API container receives only the application
+      # user's MINIO_ACCESS_KEY / MINIO_SECRET_KEY.
+      MINIO_ROOT_USER: ""
+      MINIO_ROOT_PASSWORD: ""
+    ports:
+      - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
+    volumes:
+      # Local-storage fallback and console outbox survive container restarts.
+      - media_data:/app/var/media
+      - outbox_data:/app/var/outbox
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/ready', timeout=3)\"",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  migrate:
+    # Controlled, one-shot migration command. It is deliberately not part of
+    # backend startup and is not enabled by default:
+    #   docker compose --profile tools run --rm migrate
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: messenger-backend:local
+    profiles: ["tools"]
+    restart: "no"
+    command: ["alembic", "upgrade", "head"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-messenger}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-messenger}
+      # A migration only needs PostgreSQL; do not expose object-storage secrets.
+      MINIO_ROOT_USER: ""
+      MINIO_ROOT_PASSWORD: ""
+      MINIO_ACCESS_KEY: ""
+      MINIO_SECRET_KEY: ""
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 volumes:
   postgres_data:
     name: messenger_postgres_data
+  minio_data:
+    name: messenger_minio_data
+  media_data:
+    name: messenger_media_data
+  outbox_data:
+    name: messenger_outbox_data

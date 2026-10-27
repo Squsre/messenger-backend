@@ -19,6 +19,7 @@ archives, HTML and SVG are refused.
 
 from __future__ import annotations
 
+import hashlib
 import struct
 import unicodedata
 from dataclasses import dataclass
@@ -85,6 +86,7 @@ class PreparedUpload:
     width: int | None
     height: int | None
     data: bytes
+    checksum_sha256: str = ""
 
 
 def sanitise_filename(filename: str | None) -> str:
@@ -319,4 +321,5 @@ def prepare_upload(
         width=detected.width,
         height=detected.height,
         data=data,
+        checksum_sha256=hashlib.sha256(data).hexdigest(),
     )

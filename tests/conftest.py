@@ -343,8 +343,11 @@ def test_settings(db_url: str, redis_namespace: str, tmp_path) -> Settings:
         email_backend="disabled",
         email_from="no-reply@messenger.test",
         public_base_url="http://testserver",
-        # Never write uploads into the repository during tests.
+        # Existing media tests use the isolated local backend. MinIO-specific
+        # tests opt in explicitly and use a unique key prefix.
+        media_storage_backend="local",
         media_storage_path=str(tmp_path / "media"),
+        minio_key_prefix="",
     )
 
 

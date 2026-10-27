@@ -18,11 +18,12 @@ Usage::
 
 from __future__ import annotations
 
+import re
 from functools import lru_cache
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
-from pydantic import Field, SecretStr, ValidationInfo, field_validator
+from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 # JWT algorithms we are willing to sign/verify with. Restricted to HMAC so it is
@@ -37,10 +38,10 @@ ALLOWED_REDIS_SCHEMES: frozenset[str] = frozenset({"redis", "rediss"})
 # Email delivery backends. ``console`` is development-only.
 ALLOWED_EMAIL_BACKENDS: frozenset[str] = frozenset({"console", "smtp", "disabled"})
 
-# Media backends. Local disk is the only implementation in this phase; the
-# interface is deliberately backend-agnostic so MinIO/S3 can be added later
-# without changing the HTTP contract. See app/services/storage.py.
-ALLOWED_MEDIA_STORAGE_BACKENDS: frozenset[str] = frozenset({"local"})
+# Media backends. The HTTP layer is backend-agnostic; local disk is useful for
+# development/tests and MinIO is the durable object-storage backend used by the
+# Compose stack. See app/services/storage.py.
+ALLOWED_MEDIA_STORAGE_BACKENDS: frozenset[str] = frozenset({"local", "minio"})
 
 # Substrings that identify the throw-away placeholder shipped in `.env.example`.
 # They are rejected outside local development so an insecure secret cannot reach
@@ -229,12 +230,12 @@ class Settings(DatabaseSettings):
     message_max_limit: int = Field(default=100, ge=1, le=200)
 
     # --- Media (uploaded photos and files) ---
-    # Local disk now; the same interface can be backed by MinIO/S3 later. The
-    # directory is deliberately outside the application package and is ignored
-    # by Git when the default ``var/media`` is used.
+    # ``local`` keeps development and the original test-suite contract working.
+    # ``minio`` is the durable object-storage backend used by Compose. The HTTP
+    # contract is identical; only the storage implementation changes.
     media_storage_backend: str = Field(
         default="local",
-        description="Media storage backend (currently only 'local').",
+        description="Media storage backend: 'local' or 'minio'.",
     )
     media_storage_path: str = Field(
         default="var/media",
@@ -261,6 +262,78 @@ class Settings(DatabaseSettings):
         ge=1,
         le=100_000,
         description="Maximum accepted image width/height from file headers.",
+    )
+
+    # --- MinIO object storage (MEDIA_STORAGE_BACKEND=minio) ---
+    # ``minio_endpoint`` is the container-to-container (or local test) address;
+    # it must not include a scheme. ``minio_public_endpoint`` is the address used
+    # only to sign short-lived download URLs, so it may differ when the API runs
+    # in Docker and the client reaches MinIO through a published port.
+    minio_endpoint: str = Field(
+        default="127.0.0.1:9000",
+        description="MinIO API endpoint as host:port (no scheme).",
+    )
+    minio_public_endpoint: str = Field(
+        default="127.0.0.1:9000",
+        description="Endpoint used when signing client-facing presigned URLs.",
+    )
+    minio_access_key: str = Field(
+        default="",
+        description="MinIO application access key (not the root account).",
+    )
+    minio_secret_key: SecretStr = Field(
+        default=SecretStr(""),
+        description="MinIO application secret key (environment only).",
+    )
+    minio_bucket: str = Field(
+        default="messenger-media",
+        description="Private bucket holding uploaded media.",
+    )
+    minio_secure: bool = Field(
+        default=False,
+        description="Use HTTPS for MinIO connections and presigned URLs.",
+    )
+    minio_region: str = Field(
+        default="us-east-1",
+        description="S3 region used by the MinIO client.",
+    )
+    minio_key_prefix: str = Field(
+        default="",
+        description=(
+            "Optional object-name prefix for this application/environment. "
+            "A trailing slash is added automatically."
+        ),
+    )
+    minio_presigned_url_expires_seconds: int = Field(
+        default=300,
+        ge=30,
+        le=3600,
+        description="Lifetime of a presigned download URL (30-3600 seconds).",
+    )
+    minio_auto_create_bucket: bool = Field(
+        default=False,
+        description=(
+            "Create the bucket at startup when missing. Compose uses a separate "
+            "initialization service instead; enable only for controlled setups."
+        ),
+    )
+    minio_connect_timeout_seconds: float = Field(
+        default=2.0,
+        gt=0,
+        le=30,
+        description="Maximum time to establish a MinIO connection.",
+    )
+    minio_read_timeout_seconds: float = Field(
+        default=10.0,
+        gt=0,
+        le=120,
+        description="Maximum time to wait for a MinIO response.",
+    )
+    minio_max_retries: int = Field(
+        default=2,
+        ge=0,
+        le=10,
+        description="Retries for transient MinIO failures.",
     )
 
     # --- Realtime (WebSocket) ---
@@ -399,6 +472,79 @@ class Settings(DatabaseSettings):
         if not path:
             raise ValueError("media_storage_path must not be empty")
         return path
+
+    @field_validator("minio_endpoint", "minio_public_endpoint")
+    @classmethod
+    def _validate_minio_endpoint(cls, value: str) -> str:
+        """Accept only a bare ``host:port`` (the SDK adds the scheme)."""
+        endpoint = value.strip().rstrip("/")
+        if not endpoint:
+            raise ValueError("MinIO endpoint must not be empty")
+        if "://" in endpoint:
+            raise ValueError("MinIO endpoint must be host:port without a scheme")
+        if any(character.isspace() for character in endpoint):
+            raise ValueError("MinIO endpoint must not contain whitespace")
+        parsed = urlsplit(f"//{endpoint}")
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("MinIO endpoint has an invalid port") from exc
+        if not parsed.hostname or port is None:
+            raise ValueError("MinIO endpoint must be host:port")
+        if not 1 <= port <= 65535:
+            raise ValueError("MinIO endpoint port must be between 1 and 65535")
+        if parsed.path or parsed.query or parsed.fragment or parsed.username:
+            raise ValueError("MinIO endpoint must be host:port without a path")
+        return endpoint
+
+    @field_validator("minio_bucket")
+    @classmethod
+    def _validate_minio_bucket(cls, value: str) -> str:
+        bucket = value.strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket):
+            raise ValueError(
+                "minio_bucket must be 3-63 lowercase letters, digits, dots or "
+                "hyphens and start/end with a letter or digit"
+            )
+        if ".." in bucket or ".-" in bucket or "-." in bucket:
+            raise ValueError("minio_bucket contains an invalid dot/hyphen sequence")
+        return bucket
+
+    @field_validator("minio_key_prefix")
+    @classmethod
+    def _validate_minio_key_prefix(cls, value: str) -> str:
+        prefix = value.strip().strip("/")
+        if not prefix:
+            return ""
+        if ".." in prefix or "//" in prefix:
+            raise ValueError("minio_key_prefix must not contain '..' or '//'")
+        if not re.fullmatch(r"[A-Za-z0-9._/-]+", prefix):
+            raise ValueError("minio_key_prefix contains unsupported characters")
+        return f"{prefix}/"
+
+    @model_validator(mode="after")
+    def _validate_minio_credentials(self) -> "Settings":
+        """Require application credentials whenever MinIO is selected."""
+        if self.media_storage_backend != "minio":
+            return self
+        if not self.minio_access_key.strip():
+            raise ValueError(
+                "minio_access_key is required when media_storage_backend='minio'"
+            )
+        secret = self.minio_secret_key.get_secret_value()
+        if len(secret) < 8:
+            raise ValueError(
+                "minio_secret_key must be at least 8 characters when "
+                "media_storage_backend='minio'"
+            )
+        environment = self.app_env.strip().lower()
+        if environment not in _LOCAL_ENVIRONMENTS and any(
+            marker in secret.lower() for marker in INSECURE_SECRET_MARKERS
+        ):
+            raise ValueError(
+                "minio_secret_key looks like an example value and is not allowed here"
+            )
+        return self
 
     @field_validator("redis_url")
     @classmethod

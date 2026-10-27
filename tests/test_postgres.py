@@ -107,7 +107,7 @@ def test_postgres_migrations_from_empty_to_head_and_back(db_url: str) -> None:
             revision = connection.execute(
                 text("SELECT version_num FROM alembic_version")
             ).scalar_one()
-            assert revision == "0008_add_groups"
+            assert revision == "0009_media_storage_metadata"
 
             migration_context = MigrationContext.configure(connection)
             diff = compare_metadata(migration_context, Base.metadata)

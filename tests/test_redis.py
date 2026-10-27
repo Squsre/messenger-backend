@@ -311,13 +311,13 @@ def test_rate_limit_backend_failure_returns_503(client, api, monkeypatch) -> Non
     assert response.json()["error"]["code"] == "service_unavailable"
 
 
-def test_readiness_reports_postgres_and_redis(client) -> None:
+def test_readiness_reports_postgres_redis_and_storage(client) -> None:
     response = client.get(READY_URL)
 
     assert response.status_code == 200
     assert response.json() == {
         "status": "ok",
-        "checks": {"database": "ok", "redis": "ok"},
+        "checks": {"database": "ok", "redis": "ok", "storage": "ok"},
     }
 
 

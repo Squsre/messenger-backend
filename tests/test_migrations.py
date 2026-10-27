@@ -24,7 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 #: Revision created by the phase-3 migration; the base point for data-preservation
 #: tests, because it is the last schema that existed before the profile phase.
 AUTH_REVISION = "0002_create_users_and_token_blocklist"
-HEAD_REVISION = "0008_add_groups"
+HEAD_REVISION = "0009_media_storage_metadata"
 
 _USERNAME_PATTERN = re.compile(r"^[a-z0-9_]{3,32}$")
 
@@ -177,6 +177,9 @@ def test_upgrade_head_creates_schema(migration_url: str) -> None:
             "width",
             "height",
             "status",
+            "storage_backend",
+            "checksum_sha256",
+            "etag",
             "conversation_id",
             "uploader_id",
             "message_id",
@@ -190,6 +193,7 @@ def test_upgrade_head_creates_schema(migration_url: str) -> None:
             "ck_media_size_positive",
             "ck_media_dimensions_valid",
             "ck_media_status_allowed",
+            "ck_media_storage_backend_allowed",
         } <= media_checks
 
         invitation_columns = {
@@ -301,6 +305,13 @@ def test_migrations_do_not_rewrite_earlier_revisions() -> None:
     assert 'revision: str = "0008_add_groups"' in groups
     assert 'down_revision: str | None = "0007_add_media"' in groups
     assert "0009" not in groups
+
+    storage_metadata = (versions / "0009_media_storage_metadata.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'revision: str = "0009_media_storage_metadata"' in storage_metadata
+    assert 'down_revision: str | None = "0008_add_groups"' in storage_metadata
+    assert "0010" not in storage_metadata
 
 
 def test_email_uniqueness_is_enforced_by_the_database(migration_url: str) -> None:
@@ -502,13 +513,13 @@ def test_upgrade_then_downgrade_to_base(migration_url: str) -> None:
         engine.dispose()
 
 
-def test_downgrade_two_steps_removes_groups_and_media(
+def test_downgrade_to_0006_removes_groups_and_media(
     migration_url: str,
 ) -> None:
-    """Rolling back 0008 and 0007 removes groups/media and restores text-only bodies."""
+    """Rolling back 0009-0007 removes groups/media and restores text-only bodies."""
     config = _alembic_config(migration_url)
     command.upgrade(config, "head")
-    command.downgrade(config, "-2")
+    command.downgrade(config, "0006_message_statuses")
 
     engine = create_db_engine(migration_url)
     try:
@@ -559,11 +570,11 @@ def test_downgrade_two_steps_removes_groups_and_media(
         engine.dispose()
 
 
-def test_downgrade_three_steps_removes_the_status_columns(migration_url: str) -> None:
-    """Rolling back 0008-0006 keeps every message and the idempotency key."""
+def test_downgrade_to_0005_removes_the_status_columns(migration_url: str) -> None:
+    """Rolling back 0009-0006 keeps every message and the idempotency key."""
     config = _alembic_config(migration_url)
     command.upgrade(config, "head")
-    command.downgrade(config, "-3")
+    command.downgrade(config, "0005_message_client_id")
 
     engine = create_db_engine(migration_url)
     try:
@@ -582,13 +593,13 @@ def test_downgrade_three_steps_removes_the_status_columns(migration_url: str) ->
         engine.dispose()
 
 
-def test_downgrade_four_steps_removes_the_idempotency_key(
+def test_downgrade_to_0004_removes_the_idempotency_key(
     migration_url: str,
 ) -> None:
-    """Rolling back 0008-0005 still keeps every chat table and row."""
+    """Rolling back 0009-0005 still keeps every chat table and row."""
     config = _alembic_config(migration_url)
     command.upgrade(config, "head")
-    command.downgrade(config, "-4")
+    command.downgrade(config, "0004_add_conversations")
 
     engine = create_db_engine(migration_url)
     try:
@@ -607,13 +618,13 @@ def test_downgrade_four_steps_removes_the_idempotency_key(
         engine.dispose()
 
 
-def test_downgrade_five_steps_removes_only_the_chat_tables(
+def test_downgrade_to_0003_removes_only_the_chat_tables(
     migration_url: str,
 ) -> None:
-    """Rolling back 0008-0004 keeps the phase-6 profile schema."""
+    """Rolling back 0009-0004 keeps the phase-6 profile schema."""
     config = _alembic_config(migration_url)
     command.upgrade(config, "head")
-    command.downgrade(config, "-5")
+    command.downgrade(config, "0003_add_profiles_and_social")
 
     engine = create_db_engine(migration_url)
     try:
@@ -642,11 +653,11 @@ def test_downgrade_five_steps_removes_only_the_chat_tables(
         engine.dispose()
 
 
-def test_downgrade_six_steps_removes_the_profile_schema(migration_url: str) -> None:
-    """0003's downgrade still works now that 0004-0008 sit on top of it."""
+def test_downgrade_to_0002_removes_the_profile_schema(migration_url: str) -> None:
+    """0003's downgrade still works now that 0004-0009 sit on top of it."""
     config = _alembic_config(migration_url)
     command.upgrade(config, "head")
-    command.downgrade(config, "-6")
+    command.downgrade(config, "0002_create_users_and_token_blocklist")
 
     engine = create_db_engine(migration_url)
     try:
@@ -728,7 +739,7 @@ def test_status_migration_preserves_existing_messages(migration_url: str) -> Non
     finally:
         engine.dispose()
 
-    command.downgrade(config, "-3")
+    command.downgrade(config, "0005_message_client_id")
 
     engine = create_db_engine(migration_url)
     try:
@@ -922,6 +933,80 @@ def test_media_constraints_are_enforced_by_the_database(migration_url: str) -> N
         engine.dispose()
 
 
+def test_downgrade_0009_preserves_media_and_reapplies_local_backend(
+    migration_url: str,
+) -> None:
+    """The metadata-only revision must be reversible without losing media rows."""
+    config = _alembic_config(migration_url)
+    command.upgrade(config, "head")
+
+    engine = create_db_engine(migration_url)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO users (email, username, hashed_password, is_active) "
+                    "VALUES ('alice@example.com', 'alice', 'h', TRUE)"
+                )
+            )
+            connection.execute(
+                text("INSERT INTO conversations (pair_key) VALUES ('1:1')")
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO media "
+                    "(public_id, storage_key, original_filename, content_type, "
+                    " size_bytes, storage_backend, checksum_sha256, etag, "
+                    " conversation_id, uploader_id) "
+                    "VALUES (:public_id, :storage_key, 'photo.png', 'image/png', "
+                    "        10, 'minio', :checksum, 'etag-1', 1, 1)"
+                ),
+                {
+                    "public_id": "a" * 32,
+                    "storage_key": "b" * 32 + ".png",
+                    "checksum": "c" * 64,
+                },
+            )
+    finally:
+        engine.dispose()
+
+    command.downgrade(config, "0008_add_groups")
+
+    engine = create_db_engine(migration_url)
+    try:
+        inspector = inspect(engine)
+        columns = {column["name"] for column in inspector.get_columns("media")}
+        assert {"storage_backend", "checksum_sha256", "etag"} & columns == set()
+        with engine.connect() as connection:
+            row = connection.execute(
+                text("SELECT public_id, storage_key FROM media")
+            ).one()
+        assert row.public_id == "a" * 32
+        assert row.storage_key == "b" * 32 + ".png"
+    finally:
+        engine.dispose()
+
+    command.upgrade(config, "head")
+
+    engine = create_db_engine(migration_url)
+    try:
+        inspector = inspect(engine)
+        columns = {column["name"] for column in inspector.get_columns("media")}
+        assert {"storage_backend", "checksum_sha256", "etag"} <= columns
+        with engine.connect() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT storage_backend, checksum_sha256, etag "
+                    "FROM media"
+                )
+            ).one()
+        assert row.storage_backend == "local"
+        assert row.checksum_sha256 is None
+        assert row.etag is None
+    finally:
+        engine.dispose()
+
+
 def test_downgrade_refuses_to_drop_media_only_messages(migration_url: str) -> None:
     """The 0007 downgrade must not silently delete or rewrite message content."""
     config = _alembic_config(migration_url)
@@ -947,7 +1032,7 @@ def test_downgrade_refuses_to_drop_media_only_messages(migration_url: str) -> No
         engine.dispose()
 
     with pytest.raises(RuntimeError, match="media-only messages"):
-        command.downgrade(config, "-2")
+        command.downgrade(config, "0006_message_statuses")
 
 
 def test_group_schema_and_constraints_are_enforced_by_the_database(
@@ -1147,7 +1232,7 @@ def test_downgrade_refuses_to_delete_existing_groups(migration_url: str) -> None
         engine.dispose()
 
     with pytest.raises(RuntimeError, match="group conversations"):
-        command.downgrade(config, "-1")
+        command.downgrade(config, "0007_add_media")
 
     engine = create_db_engine(migration_url)
     try:

@@ -22,7 +22,7 @@ class ReadinessResponse(BaseModel):
     status: Literal["ok", "degraded"] = Field(description="Overall readiness.")
     checks: dict[str, Literal["ok", "error"]] = Field(
         description="Per-dependency readiness results.",
-        examples=[{"database": "ok", "redis": "ok"}],
+        examples=[{"database": "ok", "redis": "ok", "storage": "ok"}],
     )
 
 

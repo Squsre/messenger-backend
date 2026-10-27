@@ -82,9 +82,10 @@ OPENAPI_TAGS = [
     {
         "name": "media",
         "description": (
-            "Authenticated upload, metadata, download, attachment and deletion of "
-            "conversation-scoped photos and files. Binaries live behind a storage "
-            "interface (local disk in this phase), never in the database."
+            "Authenticated upload, metadata, download, short-lived direct URL, "
+            "attachment and deletion of conversation-scoped photos and files. "
+            "Binaries live in private MinIO object storage (or local disk in "
+            "development), never in the database."
         ),
     },
 ]
@@ -177,13 +178,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
 
     email_service = build_email_service(settings)
-    # Local disk by default; the endpoints only see the StorageService protocol.
+    # Local disk or MinIO, selected by configuration; endpoints only see the
+    # StorageService protocol.
     storage = build_storage(settings)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         logger.info("Database engine ready (%s)", database.safe_url)
         logger.info("Redis client configured (%s)", redis_manager.safe_url)
+        logger.info("Media storage backend configured (%s)", storage.backend_name)
+        ensure_bucket = getattr(storage, "ensure_bucket", None)
+        if (
+            settings.media_storage_backend == "minio"
+            and settings.minio_auto_create_bucket
+        ):
+            try:
+                ensure_bucket()
+            except Exception:
+                logger.exception("Could not initialize the MinIO bucket at startup")
+        if not storage.health():
+            logger.warning(
+                "Media storage is not ready at startup; uploads/downloads will fail "
+                "until the configured bucket or directory is available"
+            )
         if not redis_manager.ping():
             logger.warning(
                 "Redis is not reachable at startup; cache will fail open and rate "
@@ -196,9 +213,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # Tell every connected client the server is going away before the
             # database and Redis resources are released.
             await ws_manager.close_all(code=1001, reason="Server is shutting down")
+            storage.close()
             redis_manager.close()
             database.dispose()
-            logger.info("Redis client and database engine disposed")
+            logger.info("Media storage, Redis client and database engine disposed")
 
     app = FastAPI(
         title=settings.app_name,

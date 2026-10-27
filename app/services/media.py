@@ -14,6 +14,7 @@ missing one.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import secrets
 from datetime import datetime, timezone
@@ -128,18 +129,27 @@ def store_uploads(
     The binary is written first (atomically, under a server-generated key) and
     the rows are committed together. If validation, storage or the database
     fails, every key written by this request is removed again. A process crash
-    between the two steps can still leave an orphan file; a background sweeper
-    is a later operational concern, documented in the README.
+    between the two steps can still leave an orphan object; the conservative
+    ``app.tools.media_orphans`` reconciler reports and removes those only after
+    a grace period, as documented in the README.
     """
     written: list[str] = []
     rows: list[Media] = []
     try:
+        backend_name = getattr(storage, "backend_name", "local")
         for prepared in uploads:
             key = new_storage_key(prepared.extension)
             # Record the key before writing: if the backend fails after creating
             # the object, cleanup still knows what to remove.
             written.append(key)
-            storage.save(key, prepared.data)
+            stored = storage.save(
+                key,
+                prepared.data,
+                content_type=prepared.content_type,
+            )
+            checksum = prepared.checksum_sha256 or hashlib.sha256(
+                prepared.data
+            ).hexdigest()
             rows.append(
                 Media(
                     public_id=new_public_id(),
@@ -150,6 +160,9 @@ def store_uploads(
                     width=prepared.width,
                     height=prepared.height,
                     status="ready",
+                    storage_backend=backend_name,
+                    checksum_sha256=checksum,
+                    etag=getattr(stored, "etag", None),
                     conversation_id=conversation.id,
                     uploader_id=uploader.id,
                     created_at=utcnow(),

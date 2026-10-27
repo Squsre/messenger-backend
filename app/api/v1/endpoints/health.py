@@ -24,6 +24,14 @@ def _database_is_ready(database) -> bool:
         return False
 
 
+def _storage_is_ready(storage) -> bool:
+    """Check the configured media backend (bucket presence for MinIO)."""
+    try:
+        return bool(storage.health())
+    except Exception:  # pragma: no cover - exercised by failure injection
+        return False
+
+
 @router.get(
     "/health",
     response_model=HealthResponse,
@@ -60,9 +68,10 @@ async def health(settings: Settings = Depends(get_app_settings)) -> HealthRespon
     response_model=ReadinessResponse,
     summary="Readiness check",
     description=(
-        "Check the dependencies needed to serve requests: PostgreSQL and Redis. "
-        "Returns 200 when both answer and 503 otherwise. The liveness endpoint "
-        "at /health intentionally does not depend on either service."
+        "Check the dependencies needed to serve requests: PostgreSQL, Redis and "
+        "the configured media storage backend (MinIO bucket or local directory). "
+        "Returns 200 when all answer and 503 otherwise. The liveness endpoint "
+        "at /health intentionally does not depend on any of them."
     ),
     responses={
         200: {"description": "All dependencies are reachable."},
@@ -73,15 +82,18 @@ async def readiness(request: Request) -> JSONResponse:
     """Report dependency readiness without blocking the event loop."""
     database = request.app.state.database
     cache = request.app.state.cache
+    storage = request.app.state.storage
     database_ok = await run_in_threadpool(_database_is_ready, database)
     redis_ok = await run_in_threadpool(cache.ping)
+    storage_ok = await run_in_threadpool(_storage_is_ready, storage)
 
     checks = {
         "database": "ok" if database_ok else "error",
         "redis": "ok" if redis_ok else "error",
+        "storage": "ok" if storage_ok else "error",
     }
     payload = ReadinessResponse(
-        status="ok" if database_ok and redis_ok else "degraded",
+        status="ok" if database_ok and redis_ok and storage_ok else "degraded",
         checks=checks,
     )
     return JSONResponse(

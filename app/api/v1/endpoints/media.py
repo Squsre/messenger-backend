@@ -5,6 +5,7 @@ Routes (all under ``/api/v1``):
 * ``POST   /conversations/{conversation_id}/media`` — upload 1..N files
 * ``GET    /media/{media_id}``                      — metadata
 * ``GET    /media/{media_id}/content``              — authenticated bytes
+* ``GET    /media/{media_id}/url``                  — short-lived presigned URL
 * ``DELETE /media/{media_id}``                      — delete an unattached upload
 * ``POST   /media/{media_id}/attach``               — attach to one of my messages
 
@@ -33,12 +34,14 @@ from app.core.errors import (
     ForbiddenError,
     NotFoundError,
     PayloadTooLargeError,
+    ServiceUnavailableError,
 )
 from app.db.models import ConversationKind, Message, User
 from app.db.session import get_db
 from app.schemas.chat import build_message
 from app.schemas.media import (
     AttachMediaRequest,
+    MediaAccessUrlRead,
     MediaBatchRead,
     MediaRead,
     build_media,
@@ -48,7 +51,11 @@ from app.services import chat as chat_service
 from app.services import media as media_service
 from app.services.contact import is_blocked_between
 from app.services.media_validation import prepare_upload
-from app.services.storage import StorageError, StorageObjectNotFound
+from app.services.storage import (
+    StorageError,
+    StorageObjectNotFound,
+    StorageUnsupported,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +71,10 @@ _NOT_FOUND = {
     "description": "No such media/message, or the caller is not a conversation member.",
 }
 _CONFLICT = {
-    "description": "The media is already attached, or the message already has media.",
+    "description": (
+        "The media is already attached, the message already has media, or the "
+        "storage backend does not support the requested operation."
+    ),
 }
 _TOO_LARGE = {
     "description": "The file exceeds MEDIA_MAX_UPLOAD_BYTES.",
@@ -75,6 +85,9 @@ _UNSUPPORTED = {
 _RATE_LIMITED = {
     "description": "Too many media requests. Retry after the ``Retry-After`` interval.",
 }
+_STORAGE_UNAVAILABLE = {
+    "description": "The configured object-storage backend is temporarily unavailable.",
+}
 
 _MEDIA_ERRORS = {
     401: _UNAUTHORIZED,
@@ -84,6 +97,7 @@ _MEDIA_ERRORS = {
     413: _TOO_LARGE,
     415: _UNSUPPORTED,
     429: _RATE_LIMITED,
+    503: _STORAGE_UNAVAILABLE,
 }
 
 
@@ -208,13 +222,19 @@ async def upload_media(
         for upload in files:
             await upload.close()
 
-    rows = media_service.store_uploads(
-        db,
-        conversation=conversation,
-        uploader=current_user,
-        uploads=prepared,
-        storage=storage,
-    )
+    try:
+        rows = media_service.store_uploads(
+            db,
+            conversation=conversation,
+            uploader=current_user,
+            uploads=prepared,
+            storage=storage,
+        )
+    except StorageError as exc:
+        logger.exception("Could not store uploaded media")
+        raise ServiceUnavailableError(
+            "Media storage is temporarily unavailable. Please try again later."
+        ) from exc
     return MediaBatchRead(
         items=[
             build_media(row, uploader_username=current_user.username)
@@ -290,9 +310,11 @@ def download_media(
         data = storage.read(media.storage_key)
     except StorageObjectNotFound as exc:
         raise NotFoundError("Media not found.") from exc
-    except StorageError:
+    except StorageError as exc:
         logger.exception("Could not read stored media object")
-        raise
+        raise ServiceUnavailableError(
+            "Media storage is temporarily unavailable. Please try again later."
+        ) from exc
 
     return Response(
         content=data,
@@ -306,6 +328,65 @@ def download_media(
     )
 
 
+@router.get(
+    "/media/{media_id}/url",
+    response_model=MediaAccessUrlRead,
+    summary="Create a short-lived direct download URL",
+    description=(
+        "Issue a presigned object-storage URL **after** checking conversation "
+        "membership and media state. The URL expires after "
+        "``MINIO_PRESIGNED_URL_EXPIRES_SECONDS`` and must not be logged or "
+        "shared. It is only available when the MinIO backend is configured; "
+        "local storage returns ``409``. The authenticated ``/content`` route "
+        "remains the portable download path."
+    ),
+    responses=_MEDIA_ERRORS,
+)
+def get_media_url(
+    media_id: str,
+    request: Request,
+    response: Response,
+    current_user: User = Depends(deps.get_current_active_user),
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_app_settings),
+    storage=Depends(deps.get_storage),
+) -> MediaAccessUrlRead:
+    """Authorize the caller, then sign a short-lived object URL."""
+    deps.enforce_rate_limit(request, settings, "media", f"user:{current_user.id}")
+    media = media_service.require_media_for_member(
+        db, public_id=media_id, user_id=current_user.id
+    )
+    if media.status != "ready":
+        raise ConflictError("This media is not available.")
+
+    expires_seconds = settings.minio_presigned_url_expires_seconds
+    try:
+        # Do not sign a URL for a row whose object has disappeared. This mirrors
+        # the streaming route's 404 and avoids handing out a dead capability.
+        if not storage.exists(media.storage_key):
+            raise NotFoundError("Media not found.")
+        url = storage.presigned_url(
+            media.storage_key, expires_seconds=expires_seconds
+        )
+    except StorageUnsupported as exc:
+        raise ConflictError(
+            "Direct download URLs are not available for this storage backend."
+        ) from exc
+    except StorageError as exc:
+        logger.exception("Could not create a media download URL")
+        raise ServiceUnavailableError(
+            "Media storage is temporarily unavailable. Please try again later."
+        ) from exc
+
+    # A URL is a bearer capability for its short lifetime: keep it out of caches.
+    response.headers["Cache-Control"] = "private, no-store, max-age=0"
+    return MediaAccessUrlRead(
+        media_id=media.public_id,
+        url=url,
+        expires_in_seconds=expires_seconds,
+    )
+
+
 @router.delete(
     "/media/{media_id}",
     status_code=status.HTTP_204_NO_CONTENT,
@@ -313,8 +394,8 @@ def download_media(
     description=(
         "Delete a file I uploaded that is not attached to a message. Attached "
         "media is part of message history and returns ``409``; there is no "
-        "detach endpoint in this phase. A missing object on disk is tolerated so "
-        "the row can still be cleaned up."
+        "detach endpoint in this phase. A missing object in storage is tolerated "
+        "so the row can still be cleaned up."
     ),
     responses=_MEDIA_ERRORS,
 )
@@ -338,11 +419,13 @@ def delete_media(
 
     try:
         storage.delete(media.storage_key)
-    except StorageError:
+    except StorageError as exc:
         # Keep the row: without the object the metadata is useless, but a retry
         # can still complete instead of leaving an untracked file behind.
         logger.exception("Could not delete stored media object")
-        raise
+        raise ServiceUnavailableError(
+            "Media storage is temporarily unavailable. Please try again later."
+        ) from exc
 
     db.delete(media)
     db.commit()

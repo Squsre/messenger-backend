@@ -15,6 +15,10 @@ filename is only a display label and never influences the path on disk.
 synchronously. It is persisted (and constrained) so a later asynchronous
 pipeline (thumbnails, malware scan) can introduce ``pending``/``failed`` without
 a schema rewrite.
+
+``storage_backend`` records which implementation owns the object (``local`` or
+``minio``), while ``checksum_sha256`` and ``etag`` support integrity checks and
+diagnostics. The binary is never stored in this table.
 """
 
 from __future__ import annotations
@@ -57,6 +61,10 @@ class Media(Base):
             "status IN ('pending', 'ready', 'failed')",
             name="status_allowed",
         ),
+        CheckConstraint(
+            "storage_backend IN ('local', 'minio')",
+            name="storage_backend_allowed",
+        ),
         UniqueConstraint("public_id", name="uq_media_public_id"),
         UniqueConstraint("storage_key", name="uq_media_storage_key"),
         # One attachment per message; also the guarantee behind the attach API.
@@ -77,6 +85,14 @@ class Media(Base):
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="ready", server_default="ready"
     )
+    #: Backend that owns the object. Existing rows default to ``local``.
+    storage_backend: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="local", server_default="local"
+    )
+    #: SHA-256 of the exact bytes accepted by validation, for integrity checks.
+    checksum_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    #: Backend ETag (MinIO/S3), useful for diagnostics and future conditional reads.
+    etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     conversation_id: Mapped[int] = mapped_column(
         ForeignKey("conversations.id", ondelete="CASCADE"),

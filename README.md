@@ -2,8 +2,8 @@
 
 Backend for the messenger project, built with **Python 3.11**, **FastAPI** and
 **SQLAlchemy 2.0** with **PostgreSQL** as the only supported database, **Redis**
-for disposable cache/rate-limit state, plus **Alembic** for migrations and
-**Argon2id + JWT** authentication.
+for disposable cache/rate-limit state, **MinIO** for private media objects, plus
+**Alembic** for migrations and **Argon2id + JWT** authentication.
 
 > Delivered so far:
 > **Stage 1** — clean FastAPI skeleton with a health endpoint, configuration and tests.
@@ -27,11 +27,17 @@ for disposable cache/rate-limit state, plus **Alembic** for migrations and
 > **Stage 13** — Redis for a bounded public-profile cache, TTL-backed ephemeral
 > data, atomic shared rate limiting across workers, fail-open/fail-closed policy,
 > lifecycle-managed connections and PostgreSQL+Redis readiness checks.
+> **Stage 14** — private MinIO object storage for media: least-privilege
+> credentials, content-addressed metadata, short-lived presigned URLs, safe
+> orphan detection/cleanup, and storage-aware readiness.
+> **Stage 15** — a multi-stage, non-root backend image and a complete Compose
+> stack (API + PostgreSQL + Redis + MinIO), with health checks, persistent
+> volumes, controlled migrations and a production-oriented override.
 >
 > E2EE is still to come. Two-factor authentication and contact *requests* are
-> deliberately deferred and documented in the roadmap. Files are stored locally
-> behind a `StorageService` interface; MinIO/S3 is a later backend, not a
-> requirement for this stage.
+> deliberately deferred and documented in the roadmap. MinIO is the default
+> media backend in Compose; local disk remains available for development and
+> tests behind the same `StorageService` interface.
 
 ## Project layout
 
@@ -78,9 +84,12 @@ messenger/
 │   │   ├── realtime.py          # in-process WebSocket connection registry
 │   │   ├── chat.py              # conversations, membership, messages, read watermarks
 │   │   ├── group.py             # groups, roles, invitations, receipts, discovery
-│   │   ├── storage.py           # StorageService interface + local-disk backend
+│   │   ├── storage.py           # StorageService + local-disk and MinIO backends
 │   │   ├── media_validation.py  # filename/content sniffing and dimension parsing
+│   │   ├── media_orphans.py     # conservative object/database reconciliation
 │   │   └── media.py             # media rows, authorization, upload/attach rules
+│   ├── tools/
+│   │   └── media_orphans.py     # dry-run/delete CLI for unreferenced objects
 │   ├── api/
 │   │   ├── deps.py              # token chain, per-scope rate limits, services
 │   │   └── v1/
@@ -117,7 +126,8 @@ messenger/
 │       ├── 0005_add_message_client_id.py
 │       ├── 0006_add_message_statuses.py
 │       ├── 0007_add_media.py
-│       └── 0008_add_groups.py
+│       ├── 0008_add_groups.py
+│       └── 0009_media_storage_metadata.py
 ├── tests/
 │   ├── conftest.py              # fixtures + register/login and email helpers
 │   ├── test_app.py              # startup, docs, wiring
@@ -148,13 +158,20 @@ messenger/
 │   ├── _media.py               # tiny valid image/PDF/CSV upload helpers (not collected)
 │   ├── test_media.py           # upload validation, storage, auth, delete, cleanup
 │   ├── test_media_messages.py  # send/attach media, history, WS, idempotency
+│   ├── test_media_orphans.py   # conservative orphan detection and safe cleanup
+│   ├── test_minio.py           # MinIO upload/download/URL/auth/failure integration
+│   ├── test_storage.py         # storage key/config validation (no network)
 │   ├── _groups.py              # group endpoint helpers (not collected)
 │   ├── test_groups.py          # groups, discovery, invitations, roles, membership
 │   ├── test_group_messages.py  # group messages, per-member receipts, media
 │   ├── test_group_realtime.py  # group event fan-out and WebSocket authorization
 │   └── test_postgres.py        # PostgreSQL connection/migration/constraint tests
 ├── alembic.ini
-├── compose.yaml               # PostgreSQL 16 + Redis 7 development services
+├── compose.yaml               # API + PostgreSQL 16 + Redis 7 + MinIO
+├── compose.prod.yaml          # production-oriented Compose override
+├── Dockerfile                 # multi-stage, non-root backend image
+├── docker/minio/init.sh       # idempotent private bucket/user/policy setup
+├── .dockerignore
 ├── .env.example
 ├── .gitignore
 ├── pytest.ini
@@ -165,6 +182,40 @@ messenger/
 
 ## Setup
 
+### Option A — full stack with Docker Compose (recommended)
+
+```powershell
+# Create .env only if it does not exist. If it already exists, complete it in
+# place instead of overwriting your local values.
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+
+# Edit .env: set JWT_SECRET_KEY, POSTGRES_PASSWORD, REDIS_PASSWORD,
+# MINIO_ROOT_PASSWORD and MINIO_SECRET_KEY. Never commit .env.
+docker compose up --build -d
+
+# First checkout, or after pulling a new migration, apply the schema once:
+docker compose --profile tools run --rm migrate
+
+# Verify the API and its dependencies:
+docker compose ps
+Invoke-RestMethod http://127.0.0.1:8000/api/v1/health/ready
+```
+
+The default command starts `postgres`, `redis`, `minio`, the one-shot
+`minio-init` service and the `backend`. `backend` waits for PostgreSQL, Redis and
+successful MinIO bucket initialization; it does not run migrations itself.
+Use `docker compose logs -f backend` to follow API logs, and
+`docker compose down` to stop the stack without deleting the PostgreSQL or MinIO
+volumes. Never use `docker compose down -v` unless you intend to delete both.
+
+The API is published on `127.0.0.1:${BACKEND_PORT:-8000}`, PostgreSQL on
+`127.0.0.1:${POSTGRES_PORT:-5432}`, Redis on `127.0.0.1:${REDIS_PORT:-6379}`,
+MinIO's S3 API on `127.0.0.1:${MINIO_API_PORT:-9000}` and its console on
+`127.0.0.1:${MINIO_CONSOLE_PORT:-9001}`. These host ports are for development;
+`compose.prod.yaml` removes the database, Redis and MinIO host ports.
+
+### Option B — run the API locally against the Compose services
+
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -174,19 +225,20 @@ python -m pip install -r requirements-dev.txt
 # place instead of overwriting your local values.
 if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 
-# Edit .env: set a strong JWT_SECRET_KEY, POSTGRES_PASSWORD and REDIS_PASSWORD.
-# DATABASE_URL and REDIS_URL must match those passwords.
-docker compose up -d postgres redis
+# Start PostgreSQL, Redis and MinIO, including bucket initialization:
+docker compose up -d postgres redis minio minio-init
 
-# Wait until both containers report healthy:
-docker compose ps
-
-# Create/update the PostgreSQL schema:
+# Apply the schema from the host:
 .\.venv\Scripts\alembic upgrade head
 
-# Run the API locally (the API container is intentionally out of scope here):
+# MEDIA_STORAGE_BACKEND=minio in .env points the host API at 127.0.0.1:9000.
 .\.venv\Scripts\uvicorn app.main:app --reload
 ```
+
+For a host API without MinIO, set `MEDIA_STORAGE_BACKEND=local` and keep
+`MEDIA_STORAGE_PATH=var/media`; the same media API and tests then use the local
+backend. The test suite itself always selects the isolated local backend unless
+a MinIO test explicitly opts in.
 
 Run the full test suite with:
 
@@ -210,31 +262,6 @@ database is created automatically if it does not exist.
 startup does not update the existing role or database; update PostgreSQL
 manually after a backup, or deliberately use a new volume.
 
-### Start PostgreSQL and Redis for development
-
-`compose.yaml` runs PostgreSQL and Redis only (no MinIO, Celery or API
-container):
-
-```powershell
-# .env is read automatically by Docker Compose
-docker compose up -d postgres redis
-docker compose ps
-docker compose logs -f postgres redis
-```
-
-PostgreSQL uses `postgres:16-alpine`, a named volume
-(`messenger_postgres_data`), the `POSTGRES_DB` / `POSTGRES_USER` /
-`POSTGRES_PASSWORD` / `POSTGRES_PORT` variables from `.env`, and a
-`pg_isready` healthcheck. Compose refuses to start if `POSTGRES_PASSWORD` or
-`REDIS_PASSWORD` is unset. `docker compose down` stops the containers and keeps
-the database volume; `docker compose down -v` deletes the database volume and
-must be used deliberately.
-
-Redis uses `redis:7-alpine`, a password from `REDIS_PASSWORD`, a 256 MB
-`allkeys-lru` ceiling, persistence disabled (it only holds disposable data) and
-an authenticated `redis-cli ping` healthcheck. It deliberately has no volume:
-losing cache entries or rate-limit counters is harmless.
-
 Set the matching SQLAlchemy URL in `.env`:
 
 ```dotenv
@@ -249,6 +276,92 @@ URL-encode special characters in a password. `postgres://` and
 `postgresql://` shorthands are normalised to `postgresql+psycopg://` by the
 settings layer. The real password belongs only in the Git-ignored `.env`;
 `.env.example` contains a clearly marked development placeholder.
+
+### Compose services
+
+`compose.yaml` runs the API, PostgreSQL, Redis, MinIO and the one-shot
+`minio-init` initializer. It intentionally does not add Celery or other side
+services that the current code does not use.
+
+```powershell
+# .env is read automatically by Docker Compose
+docker compose up --build -d
+docker compose ps
+docker compose logs -f postgres redis minio backend
+```
+
+PostgreSQL uses `postgres:16-alpine`, a named volume
+(`messenger_postgres_data`), the `POSTGRES_DB` / `POSTGRES_USER` /
+`POSTGRES_PASSWORD` / `POSTGRES_PORT` variables from `.env`, and a
+`pg_isready` healthcheck. Compose refuses to start if `POSTGRES_PASSWORD`,
+`REDIS_PASSWORD`, `MINIO_ROOT_PASSWORD`, `MINIO_SECRET_KEY` or another required
+credential is unset. `docker compose down` stops the containers and keeps
+the database volume; `docker compose down -v` deletes the database volume and
+must be used deliberately.
+
+Redis uses `redis:7-alpine`, a password from `REDIS_PASSWORD`, a 256 MB
+`allkeys-lru` ceiling, persistence disabled (it only holds disposable data) and
+an authenticated `redis-cli ping` healthcheck. It deliberately has no volume:
+losing cache entries or rate-limit counters is harmless.
+
+### MinIO (private media)
+
+MinIO is the durable media backend in Compose. The server uses
+`MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD`; the API uses the separate
+`MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` user created by `minio-init`. The
+initializer also creates the private `MINIO_BUCKET` and attaches a
+least-privilege policy limited to that bucket. Anonymous access is explicitly
+disabled, and the API never receives the root credentials. The example
+`MINIO_SECRET_KEY` placeholder is rejected when `APP_ENV` is not a local
+environment, just like the example JWT secret.
+
+The backend connects to `http://minio:9000` inside Compose. Presigned URLs are
+signed with `MINIO_PUBLIC_ENDPOINT` (default `127.0.0.1:9000`), because a URL
+containing the internal service name would not work from the host. If you change
+`MINIO_API_PORT`, update `MINIO_PUBLIC_ENDPOINT` to the same host:port (and set
+`MINIO_SECURE=true` when the public endpoint is HTTPS). Only the
+authenticated `GET /media/{id}/url` route issues a URL, after the normal
+membership/state checks, and the URL lifetime is
+`MINIO_PRESIGNED_URL_EXPIRES_SECONDS` (30–3600 seconds, default 300). The
+`GET /media/{id}/content` streaming route remains available for clients that do
+not want a direct URL.
+
+MinIO data is stored in the named volume `messenger_minio_data`. The API also
+mounts `messenger_media_data` for the local-storage fallback and
+`messenger_outbox_data` for the development console email backend. MinIO uses
+the pinned official image digest; `minio-init` uses the pinned `minio/mc` digest.
+
+### Controlled migrations
+
+Migrations are deliberately **not** executed by backend startup. Run them once
+from a separate one-shot container (or from the host, as in Option B):
+
+```powershell
+docker compose --profile tools run --rm migrate
+docker compose run --rm backend alembic current
+```
+
+`migrate` waits for PostgreSQL, applies `alembic upgrade head` and exits. It is
+excluded from the default service set by the `tools` profile, so a normal
+`docker compose up` cannot run migrations concurrently with another backend
+replica. For a production deployment, run the same command as a release step
+before rolling out the new image.
+
+### Production-oriented override
+
+`compose.prod.yaml` removes the PostgreSQL, Redis and MinIO host ports, sets
+`APP_ENV=production`/`APP_DEBUG=false`, requires an externally reachable
+`MINIO_PUBLIC_ENDPOINT` and requires an explicit `CORS_ORIGINS` value:
+
+```powershell
+docker compose -f compose.yaml -f compose.prod.yaml up --build -d
+```
+
+The API remains bound to loopback for a reverse proxy/TLS terminator on the host.
+Use a production `EMAIL_BACKEND` (`smtp` or `disabled`) and real secrets; the
+development `console` backend is rejected when `APP_ENV=production`. The
+override is intentionally small: database backups, TLS termination, secret
+management and off-host MinIO replication remain deployment responsibilities.
 
 ### Redis (cache, shared throttling and ephemeral data)
 
@@ -304,7 +417,7 @@ back down again.
 > existing narrow table in place. This changes only Alembic metadata, never an
 > application table or migration history.
 
-Current head: **`0008_add_groups`**. Apply it to an existing
+Current head: **`0009_media_storage_metadata`**. Apply it to an existing
 database (created by an earlier stage) with a single `alembic upgrade head`:
 
 | Revision | What it adds |
@@ -317,6 +430,7 @@ database (created by an earlier stage) with a single `alembic upgrade head`:
 | `0006_message_statuses` | `messages.delivered_at` and `messages.read_at` (recipient delivery/read timestamps). |
 | `0007_add_media` | `media` (conversation-scoped upload metadata) and a nullable `messages.body` so a message can be media-only. |
 | `0008_add_groups` | Group columns on `conversations` (`kind`, `name`, `description`, `visibility`, `owner_id`), `conversation_members.role`, `group_invitations`, and `message_receipts`. |
+| `0009_media_storage_metadata` | `media.storage_backend`, `media.checksum_sha256` and `media.etag`, plus a CHECK constraint limiting the backend to `local` or `minio`. Existing rows are backfilled as `local`. |
 
 `0003` is written to be safe on a database that already contains accounts:
 `users.username` is added **nullable**, every existing account is backfilled
@@ -355,14 +469,20 @@ per group/invitee) and `message_receipts` (unique per message/member). The
 downgrade **refuses** while any group conversation exists instead of deleting
 group memberships, invitations, receipts or messages.
 
-> **Rollback warning:** from `0008`, `alembic downgrade -1` removes the group
-> schema only when no group conversations exist; `-2` then drops `media` and
-> restores `messages.body NOT NULL` (refusing if media-only messages exist);
-> `-3` removes the status timestamps; `-4` removes the idempotency key. `-5`
-> drops the three chat tables *and the messages they hold*; `-6` drops the
-> profile, verification and session columns *and their data*. All of these are
-> exercised by the test suite, but do not run them on a production database that
-> has real data without a backup.
+`0009` is additive: it adds `storage_backend` (with a server default of
+`local`), nullable `checksum_sha256` and `etag` columns, and a CHECK constraint
+for the two supported backends. Existing media rows are backfilled as `local`;
+the object bytes remain in the backend and no BLOB is added to PostgreSQL.
+
+> **Rollback warning:** from `0009`, `alembic downgrade -1` removes only the
+> storage metadata columns; `-2` removes the group schema only when no group
+> conversations exist; `-3` then drops `media` and restores
+> `messages.body NOT NULL` (refusing if media-only messages exist); `-4`
+> removes the status timestamps; `-5` removes the idempotency key. `-6` drops
+> the three chat tables *and the messages they hold*; `-7` drops the profile,
+> verification and session columns *and their data*. All of these are exercised
+> by the test suite, but do not run them on a production database that has real
+> data without a backup.
 
 
 ### Verify the PostgreSQL schema
@@ -378,8 +498,8 @@ group memberships, invitations, receipts or messages.
 .\.venv\Scripts\alembic upgrade head
 ```
 
-Expected: `current` reports `0008_add_groups (head)` and `check` reports
-`No new upgrade operations detected.` The PostgreSQL integration tests
+Expected: `current` reports `0009_media_storage_metadata (head)` and `check`
+reports `No new upgrade operations detected.` The PostgreSQL integration tests
 (see [Run the tests](#run-the-tests)) repeat this against isolated schemas and
 compare the migrated schema with `Base.metadata`.
 
@@ -890,6 +1010,7 @@ bytes; it carries the same `media` metadata as the HTTP response.
 | `POST`   | `/api/v1/conversations/{conversation_id}/media`  | Upload 1..N files to a conversation. |
 | `GET`    | `/api/v1/media/{media_id}`                       | Metadata for a file I can see. |
 | `GET`    | `/api/v1/media/{media_id}/content`               | Download the bytes (Bearer auth). |
+| `GET`    | `/api/v1/media/{media_id}/url`                   | Short-lived presigned URL (MinIO only). |
 | `DELETE` | `/api/v1/media/{media_id}`                       | Delete one of my unattached uploads. |
 | `POST`   | `/api/v1/media/{media_id}/attach`                | Attach an upload to one of my messages. |
 
@@ -911,6 +1032,7 @@ The multipart field is **`files`** (repeat it for a batch). The response is
       "width": 1,
       "height": 1,
       "status": "ready",
+      "checksum_sha256": "f0e1…",
       "message_id": null,
       "created_at": "2026-10-24T12:00:00Z"
     }
@@ -946,9 +1068,26 @@ curl.exe -s -X DELETE "http://127.0.0.1:8000/api/v1/media/7f1c..." `
   -H "Authorization: Bearer $env:TOKEN"
 ```
 
-The storage key and internal integer id are **never** returned. `id` is 128
-random bits rendered as 32 hex characters; knowing one id does not reveal any
-other. `filename` is a sanitised display label only.
+With the MinIO backend, an authorized member can ask for a short-lived direct
+URL instead of streaming through the API:
+
+```powershell
+curl.exe -s "http://127.0.0.1:8000/api/v1/media/7f1c.../url" `
+  -H "Authorization: Bearer $env:TOKEN"
+# {"media_id":"7f1c...","url":"http://127.0.0.1:9000/...","expires_in_seconds":300}
+```
+
+The URL is issued only after the same membership/state check as `/content`, is
+marked `Cache-Control: private, no-store`, and must not be logged or shared.
+`/content` remains the portable download path and is the only option for the
+local backend (where `/url` returns `409`). A storage outage returns `503`; a
+missing object returns `404`.
+
+The storage key and internal integer id are **never** returned in metadata.
+`id` is 128 random bits rendered as 32 hex characters; knowing one id does not
+reveal any other. `filename` is a sanitised display label only. The presigned URL
+necessarily contains the random object name for its short lifetime; it never
+contains a user filename or a database id.
 
 ### Allowed formats and limits
 
@@ -980,36 +1119,63 @@ other. `filename` is a sanitised display label only.
 
 ### Storage design
 
-`app/services/storage.py` defines a small `StorageService` protocol
-(`save`, `read`, `delete`, `exists`). `LocalStorage` is the only implementation
-now: files live under `MEDIA_STORAGE_PATH` (default `var/media`, outside the
-application package and ignored by Git), sharded as
-`<root>/<first-2>/<next-2>/<random-key>.<detected-extension>`. Writes go to a
-temporary file in the same directory and are atomically renamed; permissions
-are tightened to `0600` on POSIX. A malformed key read from a corrupt database
-row is rejected before it becomes a path.
+`app/services/storage.py` defines a `StorageService` protocol
+(`save`, `read`, `delete`, `exists`, `presigned_url`, `iter_objects`, `health`).
+Two implementations share the same HTTP contract:
 
-Only metadata is stored in SQL (the `media` table); no BLOB column exists.
+* `LocalStorage` writes under `MEDIA_STORAGE_PATH` (default `var/media`, outside
+  the application package and ignored by Git), sharded as
+  `<root>/<first-2>/<next-2>/<random-key>.<detected-extension>`. Writes use a
+  temporary file and an atomic rename; permissions are tightened to `0600` on
+  POSIX.
+* `MinioStorage` writes to the private `MINIO_BUCKET`. Object names are
+  `<MINIO_KEY_PREFIX><random-key>.<detected-extension>`, so a test or deployment
+  can isolate itself without a second bucket. The key prefix is validated and a
+  malformed database key is rejected before it becomes an object name.
+
+Only metadata is stored in SQL (the `media` table); no BLOB column exists. The
+`media` row records the backend, storage key, original display filename, detected
+MIME type, size, dimensions, status, SHA-256 checksum, optional backend ETag,
+conversation, uploader and optional message. Existing rows from the local phase
+are migrated with `storage_backend='local'`.
+
 Uploads write the object first and then commit the row, and remove every object
-written by the request if storage or the database fails. A process crash between
-the two steps can still leave an orphan file; a periodic sweeper is the planned
-operational follow-up. Deleting an unattached upload removes the object and then
-the row; if the object is already missing, the row can still be cleaned up.
+written by the request if storage or the database fails. Deleting an unattached
+upload removes the object and then the row; if the object is already missing,
+the row can still be cleaned up. A process crash between the object write and
+the database commit can still leave an orphan, so the repository ships a
+conservative reconciler:
 
-A future MinIO/S3 backend only needs to implement the same four methods and a
-`build_storage()` branch (for example `MEDIA_STORAGE_BACKEND=s3` plus bucket
-settings). The HTTP contract, database schema and message payloads stay
-unchanged. No S3/MinIO service is added in this phase.
+```powershell
+# Dry run: report objects with no media row, recent untracked objects, and rows
+# whose object is missing. Nothing is deleted.
+python -m app.tools.media_orphans --grace-seconds 3600
+
+# Delete only objects older than the grace period and absent from every media row.
+python -m app.tools.media_orphans --grace-seconds 3600 --delete
+```
+
+The grace period protects an upload that is still between object write and
+database commit. The tool never deletes database rows, never touches objects
+outside the configured prefix, and re-checks every candidate against the
+database immediately before deletion. Missing-object reporting is scoped to
+rows whose `storage_backend` matches the configured backend. Run it as an
+operational job, not from request handling.
 
 ### Download, deletion and attachment
 
-* `GET /media/{id}` and `/content` require a normal Bearer token and conversation
-  membership. A non-member gets **`404`**, never `403`, so ids cannot be probed.
-  A database row with a missing object also returns `404`.
+* `GET /media/{id}`, `/content` and `/url` require a normal Bearer token and
+  conversation membership. A non-member gets **`404`**, never `403`, so ids
+  cannot be probed. For `/content` and `/url`, a database row whose object is
+  missing also returns `404`; metadata remains readable for diagnosis.
+* `/url` is MinIO-only. It signs a URL after authorization, with a lifetime from
+  `MINIO_PRESIGNED_URL_EXPIRES_SECONDS`; the local backend returns `409`. The
+  URL response is `Cache-Control: private, no-store`; never log it.
 * Downloads are sent as `Content-Disposition: attachment` with
   `X-Content-Type-Options: nosniff`, `Content-Security-Policy: sandbox` and
   `Cache-Control: private, no-store`. There is no `Range` support yet, so large
-  files are returned in one response.
+  files are returned in one response. Presigned URLs also request an attachment
+  disposition, but the API does not proxy or inspect those bytes.
 * `DELETE` is uploader-only and refuses attached media with `409`; there is no
   detach endpoint in this phase. The uploader may delete an unattached file even
   if the recipient could otherwise see the conversation.
@@ -1023,8 +1189,8 @@ unchanged. No S3/MinIO service is added in this phase.
   (`MEDIA_RATE_LIMIT_ATTEMPTS` / `MEDIA_RATE_LIMIT_WINDOW_SECONDS`, default
   60/60 s). Errors use the normal envelope: `400` bad filename/empty/too many
   files, `401` auth, `403` non-uploader delete or blocked attach, `404`
-  hidden/missing, `409` conflict, `413` too large, `415` unsupported type, `429`
-  rate limit.
+  hidden/missing, `409` conflict/direct-URL unsupported, `413` too large, `415`
+  unsupported type, `429` rate limit, `503` storage backend unavailable.
 
 ## Groups
 
@@ -1417,7 +1583,7 @@ uvicorn app.main:app --reload
 | http://127.0.0.1:8000/redoc          | ReDoc                |
 | http://127.0.0.1:8000/openapi.json   | OpenAPI schema       |
 | http://127.0.0.1:8000/api/v1/health  | Liveness check       |
-| http://127.0.0.1:8000/api/v1/health/ready | PostgreSQL + Redis readiness |
+| http://127.0.0.1:8000/api/v1/health/ready | PostgreSQL + Redis + media storage readiness |
 | http://127.0.0.1:8000/api/v1/auth/*  | Authentication       |
 
 Example health response:
@@ -1431,30 +1597,41 @@ Example health response:
 }
 ```
 
-Readiness (`/api/v1/health/ready`) checks both dependencies and returns `200` or
-`503`:
+Readiness (`/api/v1/health/ready`) checks PostgreSQL, Redis and the configured
+media backend (MinIO bucket presence or a writable local directory), returning
+`200` or `503`:
 
 ```json
 {
   "status": "ok",
-  "checks": {"database": "ok", "redis": "ok"}
+  "checks": {"database": "ok", "redis": "ok", "storage": "ok"}
 }
 ```
+
+The Compose `backend` healthcheck uses this endpoint, so a missing bucket or an
+unreachable MinIO service marks the container unhealthy rather than silently
+accepting uploads that cannot be stored.
 
 ## Run the tests
 
 ```powershell
-# PostgreSQL and Redis must be healthy first.
-docker compose up -d postgres redis
+# PostgreSQL, Redis and MinIO (with its bucket initialized) must be healthy.
+docker compose up -d postgres redis minio minio-init
 .\.venv\Scripts\python.exe -m pytest
 ```
 
 Tests run against isolated PostgreSQL and Redis resources. Each test gets a
 unique short-lived PostgreSQL schema in the database named by
 `TEST_DATABASE_URL` (normally `messenger_test`), which is dropped afterwards. The
-development database named by `DATABASE_URL` is never used by the suite. Media
-tests also point `MEDIA_STORAGE_PATH` at a per-test temporary directory, so the
+development database named by `DATABASE_URL` is never used by the suite. Local
+media tests point `MEDIA_STORAGE_PATH` at a per-test temporary directory, so the
 suite never reads or writes real user uploads.
+
+`tests/test_minio.py` uses a unique `MINIO_KEY_PREFIX` per test and deletes only
+that prefix. It probes the configured MinIO bucket first; if MinIO is unavailable
+or the bucket is missing, those tests are **skipped explicitly** (shown as `s` in
+the summary), never reported as passed. The rest of the suite remains runnable
+without MinIO.
 
 `TEST_DATABASE_URL` is required and must point at a **separate** disposable
 database; the test fixtures refuse to run if it matches `DATABASE_URL`. If the
@@ -1480,7 +1657,9 @@ unique username for every pre-existing account and preserves existing rows,
 that `0004` upgrades and rolls back cleanly, that `0006` only adds nullable
 status columns (existing messages survive both directions), that `0007` alters
 `messages` without losing rows/foreign keys/indexes and refuses a downgrade when
-media-only rows exist, and that earlier migrations are never rewritten.
+media-only rows exist, that `0009` backfills existing media as `local` and adds
+the storage/checksum/ETag columns, and that earlier migrations are never
+rewritten.
 Authentication tests cover registration, login, token
 validation
 (valid / invalid / expired), `/me`, logout and revocation, disabled accounts, the
@@ -1514,7 +1693,12 @@ count, unsafe filenames, non-member and uploader-only access, deletion and
 missing objects, cleanup when a database commit fails, text-plus-media and
 media-only messages, attachment to an existing message, cross-conversation/
 foreign/fake media, block-aware attachment, idempotent WS sends with matching
-text and media, and the `message_updated` broadcast.
+text and media, and the `message_updated` broadcast. The MinIO suites add
+upload/download through the real bucket, presigned-URL authorization and expiry
+metadata, checksum/backend/ETag persistence, invalid/oversized uploads storing
+nothing, storage-outage `503` rollback, storage-aware readiness, conservative
+orphan scanning (including backend-scope safety), and storage key/config
+validation without network access.
 
 Email is never really sent during tests: the transport is replaced with an
 in-memory capture (`tests/conftest.py`), while token creation, hashing, storage,
@@ -1534,6 +1718,7 @@ variables or the local `.env` file. See `.env.example` for every supported key:
 | `APP_VERSION`    | `0.1.0`               | API version exposed in `/openapi.json`.        |
 | `API_V1_PREFIX`  | `/api/v1`             | Prefix for version 1 routes.                   |
 | `HOST` / `PORT`  | `127.0.0.1` / `8000`  | Suggested bind address.                        |
+| `BACKEND_PORT` / `UVICORN_WORKERS` | `8000` / `1` | Compose host port and worker count. Keep one worker while the WebSocket registry is in-process. |
 | `CORS_ORIGINS`   | *(empty)*             | Comma-separated allowed origins.               |
 | `DATABASE_URL`   | *(required)*          | PostgreSQL URL: `postgresql+psycopg://...`; SQLite is rejected. |
 | `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_PORT` | *(compose values)* | PostgreSQL container settings; must match `DATABASE_URL`. |
@@ -1577,12 +1762,22 @@ variables or the local `.env` file. See `.env.example` for every supported key:
 | `CONVERSATION_MAX_LIMIT` | `50`          | Hard ceiling for one conversation page.        |
 | `MESSAGE_MAX_LIMIT` | `100`             | Hard ceiling for one message page.             |
 | `CHAT_RATE_LIMIT_ATTEMPTS` / `_WINDOW_SECONDS` | `120` / `60` | Chat budget per account. |
-| `MEDIA_STORAGE_BACKEND` | `local`          | Media backend (only `local` in this phase). |
+| `MEDIA_STORAGE_BACKEND` | `local`          | `local` or `minio`. Compose sets `minio`. |
 | `MEDIA_STORAGE_PATH` | `var/media`         | Local storage root, outside the app package. |
 | `MEDIA_MAX_UPLOAD_BYTES` | `10485760`      | Per-file upload ceiling (10 MiB). |
 | `MEDIA_MAX_FILES_PER_REQUEST` | `4`         | Files accepted in one multipart upload. |
 | `MEDIA_MAX_IMAGE_DIMENSION` | `20000`       | Maximum image width/height read from the header. |
 | `MEDIA_RATE_LIMIT_ATTEMPTS` / `_WINDOW_SECONDS` | `60` / `60` | Media budget per account. |
+| `MINIO_ENDPOINT` / `MINIO_PUBLIC_ENDPOINT` | `127.0.0.1:9000` | Internal API endpoint and client-facing URL endpoint (host:port, no scheme). |
+| `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | *(required for MinIO)* | Least-privilege application credentials; never the root account. |
+| `MINIO_BUCKET` | `messenger-media` | Private bucket for media objects. |
+| `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` | *(compose only)* | MinIO server/initializer credentials; never given to the API. |
+| `MINIO_SECURE` / `MINIO_REGION` | `false` / `us-east-1` | TLS and S3 region for the client. |
+| `MINIO_KEY_PREFIX` | *(empty)* | Optional application/environment object prefix (trailing slash added). |
+| `MINIO_PRESIGNED_URL_EXPIRES_SECONDS` | `300` | Short-lived direct URL lifetime (30–3600). |
+| `MINIO_AUTO_CREATE_BUCKET` | `false` | Let startup create a missing bucket; Compose uses `minio-init` instead. |
+| `MINIO_CONNECT_TIMEOUT_SECONDS` / `MINIO_READ_TIMEOUT_SECONDS` / `MINIO_MAX_RETRIES` | `2` / `10` / `2` | MinIO client timeouts and transient retries. |
+| `MINIO_API_PORT` / `MINIO_CONSOLE_PORT` | `9000` / `9001` | Development host ports (loopback only). |
 | `WS_AUTH_TIMEOUT_SECONDS` | `5`        | Seconds allowed for the first `auth` frame.    |
 | `WS_HEARTBEAT_INTERVAL_SECONDS` | `30` | Server `ping` interval.                       |
 | `WS_IDLE_TIMEOUT_SECONDS` | `90`        | Disconnect a client that sends nothing for this long. |
@@ -1597,9 +1792,14 @@ variables or the local `.env` file. See `.env.example` for every supported key:
 | `WS_READ_MIN_INTERVAL_SECONDS` | `0.5`   | Minimum gap between read frames per connection. |
 
 `compose.yaml` also reads `POSTGRES_DB`, `POSTGRES_USER`,
-`POSTGRES_PASSWORD` and `POSTGRES_PORT` from `.env`; those four variables are
-consumed by Docker Compose, not directly by the API. `TEST_DATABASE_URL` is a
-test-only environment variable and is not part of `Settings`.
+`POSTGRES_PASSWORD`, `POSTGRES_PORT`, `REDIS_PASSWORD`, `REDIS_PORT`,
+`MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD`, `MINIO_ACCESS_KEY`,
+`MINIO_SECRET_KEY`, `MINIO_BUCKET`, `MINIO_PUBLIC_ENDPOINT`, `MINIO_API_PORT`,
+`MINIO_CONSOLE_PORT`, `BACKEND_PORT` and `UVICORN_WORKERS` from `.env`; several
+are consumed by Docker Compose and the MinIO initializer rather than directly by
+the API.
+`TEST_DATABASE_URL` and `TEST_REDIS_URL` are test-only environment variables and
+are not part of `Settings`.
 
 Generate a signing key with:
 
@@ -1617,20 +1817,21 @@ Unexpected failures are normalised to a consistent JSON envelope:
 
 ## Roadmap
 
-Channels/broadcast lists, shared object storage (MinIO/S3), and E2EE are planned
-for later stages, and realtime fan-out needs a shared pub/sub store to run in
-more than one process. PostgreSQL operational hardening (backups, CI migration
-checks) and containerizing the API are follow-up work. Rate limiting and the
+Channels/broadcast lists and E2EE are planned for later stages, and realtime
+fan-out needs a shared pub/sub store to run in more than one process. MinIO
+object storage and the containerized API are now implemented; PostgreSQL
+operational hardening (managed backups, CI migration checks), off-host object
+replication and TLS termination remain deployment work. Rate limiting and the
 public-profile cache already use Redis; the token denylist and WebSocket
 connection registry still need a shared-store design for multi-process fan-out.
 
 ### Known limitations in this phase
 
-* **PostgreSQL is a single primary database, not a cluster.** The compose
-  service is for development: one PostgreSQL 16 container, one local volume,
-  and a healthcheck. There is no replication, failover, managed backup,
-  connection pooler or multi-node deployment recipe yet. The API itself is still
-  run outside Docker in this phase.
+* **PostgreSQL is a single primary database, not a cluster.** The Compose
+  service is a single PostgreSQL 16 container with one local volume and a
+  healthcheck. There is no replication, failover, managed backup, connection
+  pooler or multi-node deployment recipe yet. The API is containerized, but the
+  development Compose stack is still a single host.
 * **The PostgreSQL schema starts empty.** There is no automatic import from the
   former local file database; this phase removed that file because its data was
   not needed. For a real deployment, take and verify backups before any schema
@@ -1646,7 +1847,7 @@ connection registry still need a shared-store design for multi-process fan-out.
 * **`request.client.host` is the proxy address** when the API runs behind one,
   which affects the stored session IP and the IP-keyed rate limits. Configure the
   proxy to overwrite `X-Forwarded-For` and read it explicitly before production.
-* **Logout revokes only the presented token**, not the brother token for the same
+* **Logout revokes only the presented token**, not the other token for the same
   device; use `POST /auth/logout/all` to end every session.
 * **Email verification does not gate login** in this phase, and password reset
   may take slightly longer for an unknown address than a known one (the work
@@ -1672,13 +1873,23 @@ connection registry still need a shared-store design for multi-process fan-out.
   chooses (`last_message_id`), not a per-message acknowledgement. Typing
   indicators are in-process and ephemeral. Message edits and deletions are still
   out of scope; media attachments are supported and described above.
-* **Media storage is local-disk and single-node.** `LocalStorage` writes under
-  `MEDIA_STORAGE_PATH` on the machine running the API. There is no replication,
-  shared volume, lifecycle policy or backup integration; a second worker sees the
-  same directory only if the deployment mounts it there. MinIO/S3 is the planned
-  backend, but no such service is added in this phase. The database/file write is
-  not a distributed transaction: a crash can leave an orphan file, and there is
-  no periodic sweeper yet.
+* **Media storage is a single MinIO node in development.** `MinioStorage` uses
+  one private bucket and a least-privilege application user. There is no
+  replication, erasure coding, lifecycle policy, object-lock or managed backup
+  recipe in `compose.yaml`; production should use a replicated MinIO/S3
+  deployment and back up the bucket. The database/object write is not a
+  distributed transaction: a crash can still leave an orphan, which the
+  conservative `app.tools.media_orphans` reconciler reports and can remove after
+  a grace period. The local fallback remains single-host by definition.
+* **Presigned URLs are bearer capabilities.** They are issued only after
+  authorization and kept short-lived, but anyone who obtains the URL can use it
+  until expiry. The API never logs them, and `/content` remains available when a
+  deployment does not want direct object URLs.
+* **Compose is a single-host development stack.** It provides health checks,
+  restart policies and named volumes, not a production orchestrator. TLS,
+  reverse-proxy configuration, secret injection from a vault, backup/restore,
+  log shipping and rolling deployments remain deployment responsibilities. The
+  `migrate` service is a one-shot tool, not an automatic startup migration.
 * **Media processing is deliberately minimal.** Files are type-checked by
   extension, declared MIME and magic bytes, and images are bounded by header
   dimensions; they are **not decoded**, scanned for malware, stripped of EXIF or

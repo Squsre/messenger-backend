@@ -1,0 +1,29 @@
+# Production-oriented override for compose.yaml.
+#
+# Usage:
+#   docker compose -f compose.yaml -f compose.prod.yaml up --build -d
+#
+# Database, Redis and MinIO ports are removed from the host network. The API
+# remains bound to loopback for a reverse proxy/TLS terminator on the host.
+# Set MINIO_PUBLIC_ENDPOINT to the externally reachable MinIO endpoint (usually
+# behind the same reverse proxy) and configure a production EMAIL_BACKEND.
+services:
+  postgres:
+    restart: always
+    ports: !reset []
+
+  redis:
+    restart: always
+    ports: !reset []
+
+  minio:
+    restart: always
+    ports: !reset []
+
+  backend:
+    restart: always
+    environment:
+      APP_ENV: production
+      APP_DEBUG: "false"
+      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:?set MINIO_PUBLIC_ENDPOINT for production}
+      CORS_ORIGINS: ${CORS_ORIGINS:?set CORS_ORIGINS for production}
