@@ -146,3 +146,6 @@ frontend/out/
 frontend/coverage/
 frontend/.env.local
 frontend/.env.*.local
+
+!frontend/src/lib/
+!frontend/src/lib/**
