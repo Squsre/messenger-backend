@@ -19,16 +19,20 @@ import { requestNotificationPermission } from "@/lib/notifications";
 import { NavRail } from "@/components/layout/nav-rail";
 import { ChatSidebar } from "@/components/layout/chat-sidebar";
 import { InfoSidebar } from "@/components/layout/info-sidebar";
+import { BottomNav } from "@/components/layout/bottom-nav";
 import { DialogRoot } from "@/components/dialogs/dialog-root";
 import { FullScreenLoader } from "@/components/common/full-screen-loader";
 import { Button } from "@/components/ui/button";
 import { useIsMobile } from "@/hooks/use-mobile";
+import { useUnreadTabTitle } from "@/hooks/use-unread-tab-title";
 import { cn } from "@/lib/utils";
 
 export default function MainLayout({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const pathname = usePathname();
   const isMobile = useIsMobile();
+  // "(N) Messenger…" tab title while unread messages exist.
+  useUnreadTabTitle();
 
   const hydrated = useAuthStore((s) => s.hydrated);
   const token = useAuthStore((s) => s.token);
@@ -77,41 +81,78 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
     return <FullScreenLoader label="Loading your session…" />;
   }
 
-  // On phones the chat list hides as soon as a chat or settings page opens.
+  // On phones the chat list hides as soon as a chat or a full page (settings,
+  // contacts) opens; the page then owns the whole width. At "/" the inverse
+  // holds: the list owns the screen and the empty-state pane is hidden, so a
+  // crushed sliver of it can never appear next to the list (single-view rule).
   const hideSidebarOnMobile =
-    isMobile && (pathname.startsWith("/c/") || pathname.startsWith("/g/") || pathname.startsWith("/settings"));
+    isMobile &&
+    (pathname.startsWith("/c/") ||
+      pathname.startsWith("/g/") ||
+      pathname.startsWith("/settings") ||
+      pathname.startsWith("/contacts"));
+  const hideMainOnMobile = isMobile && pathname === "/";
 
   return (
-    <div className="flex h-dvh overflow-hidden bg-background">
-      <NavRail />
-      {leftCollapsed ? (
-        <div
+    <div className="flex h-dvh flex-col overflow-hidden bg-background">
+      {/**
+       * The multi-column frame lives in its own row; the mobile bottom nav
+       * sits BELOW it in normal flow, so every page (list, chat, settings)
+       * keeps its full height minus the bar and nothing needs fixed-offset
+       * padding compensation.
+       */}
+      <div className="flex min-h-0 flex-1">
+        <NavRail />
+        {leftCollapsed ? (
+          <div
+            className={cn(
+              "flex h-full w-12 shrink-0 flex-col items-center gap-3 border-r bg-background py-4",
+              hideSidebarOnMobile && "hidden"
+            )}
+          >
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label="Expand chat list"
+              title="Expand chat list"
+              className="size-10 rounded-xl text-muted-foreground hover:text-foreground"
+              onClick={() => useUiStore.getState().setLeftSidebarCollapsed(false)}
+            >
+              <PanelLeftOpen className="size-5" />
+            </Button>
+            <div className="mt-2 flex size-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
+              <MessagesSquare className="size-4" />
+            </div>
+          </div>
+        ) : (
+          /*
+           * The width lives HERE, on the flex child, not on the inner aside:
+           * an unwidth'd wrapper lets the flex algorithm shrink the chat list
+           * below its target whenever the viewport narrows (the sidebar was
+           * squeezed to ~300px at 640px and left a 76px main sliver on
+           * phones). `shrink-0` + explicit widths keep the column stable
+           * through any resize; below md the list is the full-width view.
+           */
+          <div
+            className={cn(
+              "h-full min-h-0 w-full shrink-0 md:w-80 lg:w-96",
+              hideSidebarOnMobile && "hidden"
+            )}
+          >
+            <ChatSidebar />
+          </div>
+        )}
+        <main
           className={cn(
-            "flex h-full w-12 shrink-0 flex-col items-center gap-3 border-r bg-background py-4",
-            hideSidebarOnMobile && "hidden"
+            "flex min-w-0 flex-1 flex-col",
+            hideMainOnMobile && "hidden md:flex"
           )}
         >
-          <Button
-            variant="ghost"
-            size="icon"
-            aria-label="Expand chat list"
-            title="Expand chat list"
-            className="size-10 rounded-xl text-muted-foreground hover:text-foreground"
-            onClick={() => useUiStore.getState().setLeftSidebarCollapsed(false)}
-          >
-            <PanelLeftOpen className="size-5" />
-          </Button>
-          <div className="mt-2 flex size-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
-            <MessagesSquare className="size-4" />
-          </div>
-        </div>
-      ) : (
-        <div className={cn("min-h-0", hideSidebarOnMobile && "hidden")}>
-          <ChatSidebar />
-        </div>
-      )}
-      <main className="flex-1 min-w-0 flex flex-col">{children}</main>
-      <InfoSidebar />
+          {children}
+        </main>
+        <InfoSidebar />
+      </div>
+      <BottomNav />
       <DialogRoot />
     </div>
   );

@@ -122,6 +122,26 @@ function isGroupShape(raw: MessageRead | GroupMessageRead): boolean {
   return "read_count" in raw || "read_by_me" in raw;
 }
 
+/**
+ * Decide whether a frame belongs to a group conversation.
+ *
+ * The WS contract describes group fan-out as "the normal `message` event"
+ * and points at the HTTP history for the per-member counts — it does NOT
+ * promise `read_count`/`read_by_me` on every frame, so shape sniffing alone
+ * silently misroutes group traffic into the direct feed (messages then only
+ * appear after a refresh). The membership lists are authoritative instead:
+ * conversation ids are globally unique across the two lists. Shape sniffing
+ * stays as the fallback for an id the lists have not loaded yet.
+ */
+function resolveIsGroup(
+  conversationId: number,
+  message: MessageRead | GroupMessageRead
+): boolean {
+  const known = conversationTypeOf(conversationId);
+  if (known) return known === "group";
+  return isGroupShape(message);
+}
+
 /** Human preview for a notification: text, or the attachment kind. */
 function previewOf(message: MessageRead | GroupMessageRead): string {
   if (message.body) return message.body;
@@ -229,7 +249,7 @@ function handleServerFrame(raw: ServerFrame): void {
 
     case "message": {
       const message = raw.message;
-      const isGroup = isGroupShape(message);
+      const isGroup = resolveIsGroup(message.conversation_id, message);
       const chatType: ChatType = isGroup ? "group" : "direct";
       const visible = useSocketStore.getState().isConversationVisible(message.conversation_id);
       useMessageStore.getState().applyIncomingMessage({ message, isGroup });
@@ -254,13 +274,16 @@ function handleServerFrame(raw: ServerFrame): void {
     case "message_updated": {
       useMessageStore
         .getState()
-        .applyMessageUpdated(raw.message, isGroupShape(raw.message));
+        .applyMessageUpdated(
+          raw.message,
+          resolveIsGroup(raw.message.conversation_id, raw.message)
+        );
       break;
     }
 
     case "ack": {
       const message = raw.message;
-      const isGroup = isGroupShape(message);
+      const isGroup = resolveIsGroup(message.conversation_id, message);
       useMessageStore.getState().confirmAck({
         clientMessageId: raw.client_message_id,
         message,
@@ -639,6 +662,16 @@ export const useSocketStore = create<SocketStore>()((set) => ({
         // Socket down (or dropped mid-flight): fall back to the REST
         // watermark so read receipts never depend on the WS alone.
         if (!sent) void postReadRest(conversationId, lastMessageId);
+        // Every sendRead caller guarantees "the user is looking at this chat
+        // right now" (visible + pinned to bottom, focus handler, or an
+        // explicit jump-to-latest click). The group `read` echo is fanned out
+        // to members, but never rely on the echo to clear the sidebar badge:
+        // zero it locally the moment the watermark is delivered. The next
+        // authoritative list refresh corrects any drift.
+        const reading = conversationTypeOf(conversationId);
+        if (reading) {
+          useConversationStore.getState().markReadLocally(reading, conversationId);
+        }
       };
 
       if (elapsed >= READ_THROTTLE_MS) {

@@ -169,6 +169,15 @@ function toChatMessage(
 ): ChatMessage {
   const isGroup = chatType === "group";
   const group = isGroup ? (raw as GroupMessageRead) : null;
+  // WS group frames may omit the aggregate fields (the contract exposes the
+  // per-member counts via the HTTP history); fall back to the cached group
+  // row so the read/delivered ticks keep a real denominator.
+  const cachedGroup = isGroup
+    ? useConversationStore.getState().groups.find((g) => g.id === raw.conversation_id)
+    : undefined;
+  const readCount = group?.read_count ?? 0;
+  const deliveredCount = group?.delivered_count ?? 0;
+  const memberCount = group?.member_count ?? cachedGroup?.member_count ?? 0;
   return {
     id: raw.id,
     clientMessageId: "",
@@ -180,22 +189,18 @@ function toChatMessage(
     createdAt: raw.created_at,
     deliveredAt: raw.delivered_at,
     readAt: raw.read_at,
-    readCount: group?.read_count ?? 0,
-    deliveredCount: group?.delivered_count ?? 0,
-    memberCount: group?.member_count ?? 0,
+    readCount,
+    deliveredCount,
+    memberCount,
     readByMe: group?.read_by_me ?? false,
     status: isGroup
-      ? group!.read_count > 0
+      ? readCount > 0
         ? "read"
-        : group!.delivered_count > 0
+        : deliveredCount > 0
           ? "delivered"
           : "sent"
       : directStatusOf(raw),
   };
-}
-
-function isGroupMessageShape(raw: MessageRead | GroupMessageRead): boolean {
-  return "read_count" in raw || "read_by_me" in raw;
 }
 
 export const useMessageStore = create<MessageState>()(
@@ -340,7 +345,10 @@ export const useMessageStore = create<MessageState>()(
             clientMessageId,
             message: sent,
             duplicate: false,
-            isGroup: isGroupMessageShape(sent),
+            // The REST fallback knows its endpoint — no shape sniffing needed
+            // (a group response without aggregate fields must not be
+            // misclassified as a direct message).
+            isGroup: chatType === "group",
           });
           useConversationStore
             .getState()
@@ -398,7 +406,7 @@ export const useMessageStore = create<MessageState>()(
             clientMessageId,
             message: sent,
             duplicate: false,
-            isGroup: isGroupMessageShape(sent),
+            isGroup: chatType === "group",
           });
         } catch {
           set((state) => {

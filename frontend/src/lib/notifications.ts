@@ -14,7 +14,11 @@
  *   the `messenger:navigate` event handled in the main layout.
  */
 
-import { NOTIFICATIONS_ENABLED_KEY } from "@/lib/constants";
+import {
+  NOTIFICATIONS_ENABLED_KEY,
+  NOTIFICATION_BADGE_URL,
+  NOTIFICATION_ICON_URL,
+} from "@/lib/constants";
 
 type ChatPathTarget = string;
 
@@ -67,12 +71,16 @@ export function showMessageNotification(input: NotificationInput): void {
 
   try {
     // `renotify` lets a replacement (same tag) alert again; not yet in every
-    // TS DOM lib, so the options object is typed locally.
+    // TS DOM lib, so the options object is typed locally. The icon is the
+    // app's own messenger mark (gradient chat bubble) as PNG — the old
+    // placeholder logo.svg is retired everywhere, and PNG renders on every
+    // OS notification center (SVG support is spotty outside Chrome).
     const options: NotificationOptions & { renotify?: boolean } = {
       body: input.body,
       tag: input.tag,
       renotify: true,
-      icon: "/logo.svg",
+      icon: NOTIFICATION_ICON_URL,
+      badge: NOTIFICATION_BADGE_URL,
     };
     const notification = new Notification(input.title, options);
     notification.onclick = () => {

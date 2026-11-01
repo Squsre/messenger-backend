@@ -96,6 +96,9 @@ export const ACCESS_TOKEN_TTL_S = 900;
 
 /** localStorage flag the user toggles in Settings → Appearance. */
 export const NOTIFICATIONS_ENABLED_KEY = "messenger-notifications-enabled";
+/** Notification icon/badge (the messenger mark, PNG for OS compatibility). */
+export const NOTIFICATION_ICON_URL = "/notification-icon-192.png";
+export const NOTIFICATION_BADGE_URL = "/notification-icon-96.png";
 /** localStorage key for the accent theme (Settings → Appearance). */
 export const ACCENT_STORAGE_KEY = "messenger-accent";
 /** DOM attribute on <html> that activates the accent palette. */
@@ -104,7 +107,9 @@ export const ACCENT_ATTR = "data-accent";
 export const MEDIA_UPLOAD_TIMEOUT_MS = 60_000;
 
 /** Frontend release (shown in Settings → About next to the API banner). */
-export const APP_VERSION = "2.2.1";
+export const APP_VERSION = "2.4.1";
+/** Browser tab title; prefixed with "(N) " while unread messages exist. */
+export const APP_TITLE = "Messenger — Private realtime chat";
 /** Max conversation ids probed per WS `ready` reconcile (burst guard). */
 export const RECONCILE_MAX_PROBES = 12;
 /** Failed deep-link probes are not retried for this long (reconnect storms). */

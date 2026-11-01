@@ -76,9 +76,12 @@ export function UnverifiedEmailBanner({ email }: { email: string }) {
       <p className="flex items-center gap-2 text-sm font-medium text-amber-600 dark:text-amber-500">
         <MailWarning className="size-4" /> Your email is not verified yet.
       </p>
-      <p className="text-xs text-muted-foreground">
-        Open the link we sent to {email}, or paste the token on the verify
-        page. Did not arrive? Send it again.
+      <p className="break-words text-xs text-muted-foreground">
+        Open the link we sent to{" "}
+        <span dir="auto" className="break-all font-medium text-foreground">
+          {email}
+        </span>
+        , or paste the token on the verify page. Did not arrive? Send it again.
       </p>
       <Button
         variant="outline"

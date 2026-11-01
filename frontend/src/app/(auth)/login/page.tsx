@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -30,7 +29,6 @@ const DEMO_PASSWORD = "Str0ng-Passw0rd!";
 const DEFAULT_RETRY_AFTER_S = 60;
 
 export default function LoginPage() {
-  const router = useRouter();
   const login = useAuthStore((s) => s.login);
   const setAuthEmailHint = useUiStore((s) => s.setAuthEmailHint);
   const [demoBusy, setDemoBusy] = useState<string | null>(null);
@@ -88,7 +86,10 @@ export default function LoginPage() {
     try {
       await login(values);
       toast.success("Welcome back!");
-      window.location.href = "/"; // <-- به جای router.replace("/")
+      // Full page load (not client-side navigation): the auth_token cookie the
+      // middleware guards with is only written on login, and a hard reload
+      // guarantees the server sees it before the first app-shell request.
+      window.location.href = "/";
     } catch (error) {
       applyLoginError(error);
     }
@@ -100,7 +101,7 @@ export default function LoginPage() {
     try {
       await login({ email, password: DEMO_PASSWORD });
       toast.success(`Signed in as ${email.split("@")[0]}`);
-      window.location.href = "/"; // <-- به جای router.replace("/")
+      window.location.href = "/";
     } catch (error) {
       if (error instanceof ApiError && error.status === 429) {
         setRetryIn(error.retryAfterSeconds ?? DEFAULT_RETRY_AFTER_S);

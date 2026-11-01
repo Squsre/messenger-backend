@@ -2,6 +2,7 @@ import type { Metadata, Viewport } from "next";
 import localFont from "next/font/local";
 import "./globals.css";
 import { AppProviders } from "@/components/common/app-providers";
+import { APP_TITLE } from "@/lib/constants";
 
 /**
  * Local custom typography (public/fonts/, SIL OFL — see the bundled
@@ -45,7 +46,7 @@ const cinzelDecorative = localFont({
 });
 
 export const metadata: Metadata = {
-  title: "Messenger — Private realtime chat",
+  title: APP_TITLE,
   description:
     "A modern messenger frontend: direct chats, groups, media and realtime delivery over WebSocket.",
 };

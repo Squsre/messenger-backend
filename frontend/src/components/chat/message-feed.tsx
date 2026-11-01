@@ -167,6 +167,22 @@ export function MessageFeed({ chatType, conversationId }: MessageFeedProps) {
     atBottomRef.current = isAtBottom;
     setShowJump(!isAtBottom && distance > FAB_TRIGGER_DISTANCE);
 
+    // Reaching the bottom IS a read: a chat that opened at the unread
+    // divider only advances its watermark when the user scrolls down to
+    // the newest message — no new frame is required to re-run the
+    // auto-read effect (its deps do not include scroll position).
+    if (isAtBottom && feed && feed.messages.length > 0) {
+      const last = feed.messages[feed.messages.length - 1]!;
+      if (
+        last.id &&
+        last.senderUsername !== myUsername &&
+        last.senderUsername !== "__me__" &&
+        useSocketStore.getState().isConversationVisible(conversationId)
+      ) {
+        useSocketStore.getState().sendRead(conversationId, last.id);
+      }
+    }
+
     if (
       el.scrollTop < 220 &&
       feed &&
@@ -176,7 +192,7 @@ export function MessageFeed({ chatType, conversationId }: MessageFeedProps) {
       prevScrollHeightRef.current = el.scrollHeight;
       void useMessageStore.getState().loadOlder(chatType, conversationId);
     }
-  }, [chatType, conversationId, feed]);
+  }, [chatType, conversationId, feed, myUsername]);
 
   // New messages: stick to the bottom when already there. The very first
   // page defers to the unread anchor (divider) when one was captured.

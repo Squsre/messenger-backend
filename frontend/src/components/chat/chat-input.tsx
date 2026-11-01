@@ -101,8 +101,7 @@ const TEXTAREA_MAX_HEIGHT = 120;
 export function ChatInput({ chatType, conversationId }: ChatInputProps) {
   const [value, setValue] = useState("");
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
-  const [uploading, setUploading] = useState(false);
-  /** 0..100 progress of the active upload batch (null = idle). */
+  /** 0..100 progress of the active upload set (null = idle). */
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [dragging, setDragging] = useState(false);
 
@@ -147,8 +146,15 @@ export function ChatInput({ chatType, conversationId }: ChatInputProps) {
   attachmentsRef.current = attachments;
   const conversationIdRef = useRef(conversationId);
   conversationIdRef.current = conversationId;
-  /** Abortable handle of the in-flight upload batch (switch/unmount cleanup). */
-  const uploadAbortRef = useRef<AbortController | null>(null);
+  /**
+   * Per-file abort handles: canceling ONE chip aborts only that file's XHR
+   * (the previous single-controller batch design killed every in-flight
+   * file and — worse — removing a chip did not abort anything at all, so
+   * the upload silently ran to completion in the background).
+   */
+  const uploadControllersRef = useRef<Map<PendingAttachment, AbortController>>(new Map());
+  /** Per-file byte counters for the aggregated progress bar. */
+  const progressRef = useRef<Map<PendingAttachment, { loaded: number; total: number }>>(new Map());
   /** Latest addFiles, read by the stable drop-bus subscription below. */
   const addFilesRef = useRef<(files: FileList | File[]) => void>(() => undefined);
 
@@ -204,16 +210,30 @@ export function ChatInput({ chatType, conversationId }: ChatInputProps) {
   /* --------------------------------- Media ---------------------------------- */
 
   /**
+   * Aggregated 0..100 progress across every in-flight single-file upload.
+   * (Function declaration: hoisted so the callbacks above can call it.)
+   */
+  function recalcProgress() {
+    let loaded = 0;
+    let total = 0;
+    for (const entry of progressRef.current.values()) {
+      loaded += entry.loaded;
+      total += entry.total;
+    }
+    setUploadProgress(total > 0 ? Math.min(99, Math.round((loaded / total) * 100)) : null);
+  }
+
+  /**
    * Orphan prevention (DELETE /media/{id}): discard pending chips when the
-   * user leaves the chat — revoking preview URLs and deleting every
+   * user leaves the chat — revoking preview URLs, aborting every in-flight
+   * upload (the backend discards partial multiparts) and deleting every
    * uploaded-but-unattached media row so the storage backend stays clean.
-   * An in-flight upload batch is aborted (the backend discards partial
-   * multiparts, so aborted uploads leave no orphan either).
    */
   const releaseAttachments = useCallback((list: PendingAttachment[]) => {
-    uploadAbortRef.current?.abort();
-    uploadAbortRef.current = null;
     for (const attachment of list) {
+      uploadControllersRef.current.get(attachment)?.abort();
+      uploadControllersRef.current.delete(attachment);
+      progressRef.current.delete(attachment);
       URL.revokeObjectURL(attachment.previewUrl);
       if (attachment.media && !attachment.media.message_id) {
         apiClient
@@ -221,51 +241,73 @@ export function ChatInput({ chatType, conversationId }: ChatInputProps) {
           .catch(() => undefined);
       }
     }
+    recalcProgress();
   }, []);
 
-  const uploadFiles = useCallback(
-    async (batch: PendingAttachment[]) => {
-      if (batch.length === 0) return;
-      setUploading(true);
-      setUploadProgress(0);
+  /** Upload ONE attachment with its own abort handle and progress share. */
+  const uploadOne = useCallback(
+    async (attachment: PendingAttachment) => {
       const controller = new AbortController();
-      uploadAbortRef.current = controller;
+      uploadControllersRef.current.set(attachment, controller);
+      progressRef.current.set(attachment, { loaded: 0, total: attachment.file.size || 1 });
+      recalcProgress();
       try {
         const result = await uploadFilesWithProgress<{ items: MediaRead[] }>(
           `/api/v1/conversations/${conversationIdRef.current}/media`,
-          batch.map((b) => b.file),
+          [attachment.file],
           {
-            onProgress: setUploadProgress,
+            onProgress: (percent) => {
+              // XHR reports percent; keep the byte counters consistent so
+              // removing one file re-bases the aggregate correctly.
+              const total = attachment.file.size || 1;
+              progressRef.current.set(attachment, {
+                loaded: Math.round((Math.min(99, percent) / 100) * total),
+                total,
+              });
+              recalcProgress();
+            },
             timeoutMs: MEDIA_UPLOAD_TIMEOUT_MS,
             signal: controller.signal,
           }
         );
+        const media = result.items[0] ?? null;
         setAttachments((prev) =>
-          prev.map((a) => {
-            const index = batch.indexOf(a);
-            return index >= 0
-              ? { ...a, media: result.items[index] ?? a.media, error: undefined }
-              : a;
-          })
+          prev.map((a) =>
+            a === attachment ? { ...a, media, error: undefined } : a
+          )
         );
       } catch (error) {
         const canceled =
           error instanceof ApiError && error.message === "Upload canceled.";
         if (!canceled) {
-          toast.error(mediaUploadErrorMessage(error));
-          setAttachments((prev) =>
-            prev.map((a) =>
-              batch.includes(a) ? { ...a, error: "Upload failed" } : a
-            )
-          );
+          // The chip may already be gone (cancel removes it first).
+          let stillPresent = false;
+          setAttachments((prev) => {
+            stillPresent = prev.includes(attachment);
+            return prev.map((a) =>
+              a === attachment ? { ...a, error: "Upload failed" } : a
+            );
+          });
+          if (stillPresent) toast.error(mediaUploadErrorMessage(error));
         }
       } finally {
-        if (uploadAbortRef.current === controller) uploadAbortRef.current = null;
-        setUploading(false);
-        setUploadProgress(null);
+        uploadControllersRef.current.delete(attachment);
+        progressRef.current.delete(attachment);
+        recalcProgress();
       }
     },
     []
+  );
+
+  const uploadFiles = useCallback(
+    async (batch: PendingAttachment[]) => {
+      if (batch.length === 0) return;
+      // One XHR per file: independent cancel, independent progress.
+      for (const attachment of batch) {
+        void uploadOne(attachment);
+      }
+    },
+    [uploadOne]
   );
 
   const addFiles = useCallback(
@@ -327,6 +369,12 @@ export function ChatInput({ chatType, conversationId }: ChatInputProps) {
   addFilesRef.current = addFiles;
 
   const removeAttachment = (target: PendingAttachment) => {
+    // Cancel an in-flight upload FIRST so the XHR really stops — removing
+    // the chip used to leave the request running to completion silently.
+    uploadControllersRef.current.get(target)?.abort();
+    uploadControllersRef.current.delete(target);
+    progressRef.current.delete(target);
+    recalcProgress();
     setAttachments((prev) => prev.filter((a) => a !== target));
     URL.revokeObjectURL(target.previewUrl);
     // Uploaded-but-unattached media is deleted immediately so orphan files
@@ -366,9 +414,12 @@ export function ChatInput({ chatType, conversationId }: ChatInputProps) {
 
   /* --------------------------------- Sending --------------------------------- */
 
+  /** A chip uploads until its media lands or an error marks it failed. */
+  const anyUploading = attachments.some((a) => !a.media && !a.error);
+
   const canSend =
     (value.trim().length > 0 || attachments.some((a) => a.media)) &&
-    !uploading &&
+    !anyUploading &&
     !participantBlocked;
 
   const send = async () => {
@@ -524,7 +575,12 @@ export function ChatInput({ chatType, conversationId }: ChatInputProps) {
               </span>
               <button
                 type="button"
-                aria-label={`Remove ${attachment.file.name}`}
+                aria-label={
+                  attachment.media
+                    ? `Remove ${attachment.file.name}`
+                    : `Cancel upload of ${attachment.file.name}`
+                }
+                title={attachment.media ? "Remove" : "Cancel upload"}
                 className="absolute right-1 top-1 text-muted-foreground hover:text-foreground"
                 onClick={() => removeAttachment(attachment)}
               >
@@ -535,7 +591,7 @@ export function ChatInput({ chatType, conversationId }: ChatInputProps) {
         </div>
       )}
 
-      {uploading && uploadProgress !== null && (
+      {anyUploading && uploadProgress !== null && (
         <div
           className="mb-2 h-1 w-full overflow-hidden rounded-full bg-muted"
           role="progressbar"
@@ -600,7 +656,7 @@ export function ChatInput({ chatType, conversationId }: ChatInputProps) {
             onClick={() => fileInputRef.current?.click()}
             disabled={attachments.length >= MEDIA_MAX_FILES_PER_REQUEST}
           >
-            {uploading ? (
+            {anyUploading ? (
               <Loader2 className="size-4 animate-spin" />
             ) : (
               <Paperclip className="size-4" />

@@ -106,24 +106,33 @@ export default function SettingsPage() {
         </div>
       </header>
 
-      <Tabs defaultValue="profile" className="chat-scroll flex-1 overflow-y-auto p-4 md:p-6">
-        <TabsList>
-          <TabsTrigger value="profile" className="gap-1.5">
+      {/*
+        * overflow-x-hidden: the settings sheet must never scroll sideways on
+        * a phone. The tab list itself becomes a 2-column grid below `sm`
+        * (six whitespace-nowrap triggers are ~600px wide and were pushing
+        * the whole page out) and returns to a single row from `sm` up.
+        */}
+      <Tabs
+        defaultValue="profile"
+        className="chat-scroll flex-1 overflow-y-auto overflow-x-hidden p-4 md:p-6"
+      >
+        <TabsList className="grid h-auto w-full grid-cols-2 gap-0.5 sm:inline-flex sm:h-9 sm:w-fit">
+          <TabsTrigger value="profile" className="gap-1.5 px-1.5 sm:px-2">
             <UserRound className="size-4" /> Profile
           </TabsTrigger>
-          <TabsTrigger value="appearance" className="gap-1.5">
+          <TabsTrigger value="appearance" className="gap-1.5 px-1.5 sm:px-2">
             <Palette className="size-4" /> Appearance
           </TabsTrigger>
-          <TabsTrigger value="privacy" className="gap-1.5" aria-label="Privacy tab">
+          <TabsTrigger value="privacy" className="gap-1.5 px-1.5 sm:px-2" aria-label="Privacy tab">
             <ShieldCheck className="size-4" /> Privacy
           </TabsTrigger>
-          <TabsTrigger value="security" className="gap-1.5">
+          <TabsTrigger value="security" className="gap-1.5 px-1.5 sm:px-2">
             <KeyRound className="size-4" /> Password
           </TabsTrigger>
-          <TabsTrigger value="sessions" className="gap-1.5">
+          <TabsTrigger value="sessions" className="gap-1.5 px-1.5 sm:px-2">
             <MonitorSmartphone className="size-4" /> Sessions
           </TabsTrigger>
-          <TabsTrigger value="about" className="gap-1.5">
+          <TabsTrigger value="about" className="gap-1.5 px-1.5 sm:px-2">
             <Server className="size-4" /> About
           </TabsTrigger>
         </TabsList>
@@ -227,11 +236,11 @@ function ProfilePanel() {
         <UserAvatar
           name={user.display_name}
           username={user.username}
-          className="size-16 text-lg"
+          className="size-16 shrink-0 text-lg"
         />
-        <div>
-          <p className="font-medium">{displayNameOf(user.display_name, user.username)}</p>
-          <p className="text-sm text-muted-foreground">{user.email}</p>
+        <div className="min-w-0">
+          <p className="break-words font-medium">{displayNameOf(user.display_name, user.username)}</p>
+          <p className="break-all text-sm text-muted-foreground">{user.email}</p>
           <Badge variant={user.email_verified ? "secondary" : "outline"} className="mt-1">
             {user.email_verified ? "Email verified" : "Email not verified"}
           </Badge>

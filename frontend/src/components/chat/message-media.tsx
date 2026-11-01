@@ -4,6 +4,7 @@ import { useState } from "react";
 import { toast } from "sonner";
 import { Download, FileText, ImageIcon, Info, Loader2 } from "lucide-react";
 import { cn, formatBytes } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
 import { useMediaUrl } from "@/hooks/use-media-url";
 import { useMediaUrlCache } from "@/lib/media-url-cache";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -30,7 +31,7 @@ export function MediaImage({
   className?: string;
   onOpen?: (url: string) => void;
 }) {
-  const { url, loading, error, reportError } = useMediaUrl(media.id);
+  const { url, loading, error, reportError, retry } = useMediaUrl(media.id);
   const isImage = media.content_type.startsWith("image/");
   const [loaded, setLoaded] = useState(false);
   const [infoOpen, setInfoOpen] = useState(false);
@@ -43,8 +44,19 @@ export function MediaImage({
 
   if (error || (!url && !loading)) {
     return (
-      <div className="flex h-28 w-48 items-center justify-center rounded-lg border bg-muted/50 text-xs text-muted-foreground gap-2">
-        <ImageIcon className="size-4" /> Unavailable
+      <div className="flex h-28 w-48 flex-col items-center justify-center gap-1.5 rounded-lg border bg-muted/50 text-xs text-muted-foreground">
+        <span className="flex items-center gap-1.5">
+          <ImageIcon className="size-4" /> Unavailable
+        </span>
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-6 px-2 text-[11px]"
+          onClick={retry}
+          aria-label={`Retry loading ${media.filename}`}
+        >
+          Retry
+        </Button>
       </div>
     );
   }
@@ -188,7 +200,7 @@ export function MediaFileCard({ media }: { media: MediaRead }) {
           <span className="min-w-0">
             <span className="block truncate text-sm font-medium">{media.filename}</span>
             <span className="block text-xs text-muted-foreground">
-              {formatBytes(media.size_bytes)} · {media.content_type}
+              {formatBytes(media.size_bytes ?? 0)} · {media.content_type}
             </span>
           </span>
         </a>

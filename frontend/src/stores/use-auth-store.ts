@@ -3,8 +3,22 @@
 /**
  * Auth state: token, profile, and the actions that mutate them.
  *
- * The token is mirrored into a client cookie (`auth_token`) so Next.js
- * Middleware can protect routes. Every other store is reset on logout.
+ * Token storage policy (hardened):
+ * - The access token NEVER touches localStorage. A persisted, XSS-readable
+ *   JWT copy was the biggest theft surface; the persisted store now keeps
+ *   only the non-sensitive profile and expiry metadata.
+ * - The token lives in ONE place per tab (memory) plus the `auth_token`
+ *   cookie that the Next.js middleware needs for route guarding. The cookie
+ *   is `SameSite=Lax` (top-level navigations — e.g. opening a verify-email
+ *   link from a mail client — still carry it) and `Secure` under https.
+ * - On boot the token is rehydrated FROM THE COOKIE, so a refresh restores
+ *   the session without any localStorage copy of the JWT.
+ * - A truly httpOnly cookie requires the backend to set it (Set-Cookie on
+ *   /auth/login); the frontend cannot create one. This is documented for
+ *   the backend team — until then this is the strongest client-only
+ *   posture: no persistent JS-readable token store besides the cookie.
+ *
+ * Every other store is reset on logout.
  */
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
@@ -18,7 +32,6 @@ import type {
 } from "@/types/api";
 import { apiClient, configureApiClient, ApiError } from "@/lib/api-client";
 import {
-  ACCESS_TOKEN_TTL_S,
   AUTH_COOKIE_NAME,
   AUTH_STORAGE_KEY,
 } from "@/lib/constants";
@@ -51,6 +64,13 @@ interface AuthState {
   adoptToken: (tokenResponse: TokenResponse) => void;
   setHydrated: () => void;
   clearAuthState: () => void;
+  /**
+   * Boot-only: restore the in-memory token from the auth cookie. Called
+   * from the persist rehydration callback — which runs while the store
+   * singleton is still initializing (TDZ), so it must be invoked through
+   * the rehydrated state's bound actions, never via `useAuthStore`.
+   */
+  rehydrateSession: () => void;
 }
 
 /* ------------------------------ Cookie plumbing ----------------------------- */
@@ -66,6 +86,15 @@ function setAuthCookie(token: string, maxAgeSeconds: number): void {
 function clearAuthCookie(): void {
   if (typeof document === "undefined") return;
   document.cookie = `${AUTH_COOKIE_NAME}=; Path=/; Max-Age=0; SameSite=Lax`;
+}
+
+/** Read the session token back out of the auth cookie (boot rehydration). */
+function readAuthCookie(): string | null {
+  if (typeof document === "undefined") return null;
+  const entry = document.cookie
+    .split("; ")
+    .find((row) => row.startsWith(`${AUTH_COOKIE_NAME}=`));
+  return entry ? decodeURIComponent(entry.slice(AUTH_COOKIE_NAME.length + 1)) : null;
 }
 
 /* --------------------------------- The store -------------------------------- */
@@ -160,6 +189,22 @@ export const useAuthStore = create<AuthState>()(
         clearAuthCookie();
       },
 
+      rehydrateSession: () => {
+        const cookieToken = readAuthCookie();
+        const expiresAt = get().tokenExpiresAt;
+        const remainingS = expiresAt
+          ? Math.floor((expiresAt - Date.now()) / 1000)
+          : 0;
+        if (cookieToken && remainingS > 0) {
+          // Cookie token still within its lifetime — restore the session.
+          set({ token: cookieToken, isAuthenticated: true });
+        } else {
+          // No cookie / expired token: drop any stale persisted profile.
+          get().clearAuthState();
+        }
+        set({ hydrated: true });
+      },
+
       refreshProfile: async () => {
         const user = await apiClient.get<UserPrivate>("/api/v1/users/me");
         set({ user });
@@ -193,25 +238,19 @@ export const useAuthStore = create<AuthState>()(
     {
       name: AUTH_STORAGE_KEY,
       storage: createJSONStorage(() => localStorage),
+      // SECURITY: only non-sensitive metadata is persisted. The JWT itself
+      // is NOT written to localStorage — it lives in memory + the cookie.
       partialize: (state) => ({
-        token: state.token,
-        tokenExpiresAt: state.tokenExpiresAt,
         user: state.user,
-        isAuthenticated: state.isAuthenticated,
+        tokenExpiresAt: state.tokenExpiresAt,
       }),
       onRehydrateStorage: () => (state) => {
-        // Re-sync the middleware cookie after a reload.
-        if (state?.token) {
-          const remaining = state.tokenExpiresAt
-            ? Math.floor((state.tokenExpiresAt - Date.now()) / 1000)
-            : ACCESS_TOKEN_TTL_S;
-          if (remaining > 0) {
-            setAuthCookie(state.token, remaining);
-          } else {
-            state.clearAuthState();
-          }
-        }
-        state?.setHydrated();
+        // Restore the session from the cookie (the only token store that
+        // survives a reload). IMPORTANT: this callback fires while the
+        // store singleton is still being created — `useAuthStore` is in
+        // its temporal dead zone here, so the action MUST be invoked on
+        // the rehydrated state object (its closures are already bound).
+        state?.rehydrateSession();
       },
     }
   )

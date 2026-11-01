@@ -266,7 +266,7 @@ export function ChatSidebar() {
     : null;
 
   return (
-    <aside className="flex h-full w-full flex-col border-r bg-background md:w-80 lg:w-96">
+    <aside className="flex h-full w-full flex-col border-r bg-background">
       <div className="space-y-3 border-b p-4">
         <div className="flex items-center justify-between gap-2">
           <h1 className="font-brand text-lg font-bold tracking-wide">Messenger</h1>
@@ -306,7 +306,9 @@ export function ChatSidebar() {
             <Button
               variant="ghost"
               size="icon"
-              className="size-8 text-muted-foreground"
+              /* Desktop-only: on phones the chat list IS the full screen,
+                 so minimizing it would only leave an empty rail. */
+              className="hidden size-8 text-muted-foreground sm:inline-flex"
               aria-label="Minimize chat list"
               title="Minimize chat list"
               onClick={() => useUiStore.getState().setLeftSidebarCollapsed(true)}
