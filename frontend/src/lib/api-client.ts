@@ -15,6 +15,7 @@ import type {
   ApiErrorEnvelope,
   PageQuery,
 } from "@/types/api";
+import { isJwtExpired } from "@/lib/jwt";
 
 const RAW_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL ?? "").replace(/\/+$/, "");
 const DIRECT_MODE = RAW_BASE.length > 0;
@@ -230,7 +231,13 @@ async function execute(path: string, options: RequestOptions): Promise<RawRespon
 
   const finalHeaders = new Headers(headers);
   const token = anonymous ? null : tokenGetter();
-  if (token) finalHeaders.set("Authorization", `Bearer ${token}`);
+  if (token) {
+    if (isJwtExpired(token)) {
+      if (onUnauthorized) onUnauthorized();
+      throw new ApiError(401, "unauthorized", "Your session has expired. Please sign in again.");
+    }
+    finalHeaders.set("Authorization", `Bearer ${token}`);
+  }
 
   let requestBody: BodyInit | undefined;
   if (rawBody !== undefined) {

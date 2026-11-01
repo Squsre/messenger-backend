@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { useForm, useWatch } from "react-hook-form";
@@ -36,6 +36,12 @@ function ResetPasswordInner() {
   // A ?token= link jumps straight to the confirm step.
   const linkToken = params.get("token") ?? "";
   const [step, setStep] = useState<Step>(() => (linkToken ? "confirm" : "request"));
+
+  useEffect(() => {
+    if (linkToken && typeof window !== "undefined" && window.location.search) {
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+  }, [linkToken]);
 
   const requestForm = useForm<ResetRequestValues>({
     resolver: zodResolver(resetRequestSchema),

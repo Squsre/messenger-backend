@@ -35,6 +35,7 @@ import {
   AUTH_COOKIE_NAME,
   AUTH_STORAGE_KEY,
 } from "@/lib/constants";
+import { parseJwt, isJwtExpired, getJwtRemainingMs } from "@/lib/jwt";
 import { resetApplicationStores } from "@/stores/registry";
 import { clearAllDrafts } from "@/lib/draft-store";
 
@@ -73,7 +74,28 @@ interface AuthState {
   rehydrateSession: () => void;
 }
 
-/* ------------------------------ Cookie plumbing ----------------------------- */
+/* ------------------------------ Cookie & Expiry plumbing ----------------------------- */
+
+let sessionExpiryTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleExpiryTimer(remainingMs: number): void {
+  if (sessionExpiryTimer) {
+    clearTimeout(sessionExpiryTimer);
+    sessionExpiryTimer = null;
+  }
+  if (remainingMs > 0 && typeof window !== "undefined") {
+    sessionExpiryTimer = setTimeout(() => {
+      useAuthStore.getState().forceLogout("expired");
+    }, remainingMs);
+  }
+}
+
+function cancelExpiryTimer(): void {
+  if (sessionExpiryTimer) {
+    clearTimeout(sessionExpiryTimer);
+    sessionExpiryTimer = null;
+  }
+}
 
 function setAuthCookie(token: string, maxAgeSeconds: number): void {
   if (typeof document === "undefined") return;
@@ -85,7 +107,8 @@ function setAuthCookie(token: string, maxAgeSeconds: number): void {
 
 function clearAuthCookie(): void {
   if (typeof document === "undefined") return;
-  document.cookie = `${AUTH_COOKIE_NAME}=; Path=/; Max-Age=0; SameSite=Lax`;
+  const secure = window.location.protocol === "https:" ? "; Secure" : "";
+  document.cookie = `${AUTH_COOKIE_NAME}=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0; SameSite=Lax${secure}`;
 }
 
 /** Read the session token back out of the auth cookie (boot rehydration). */
@@ -121,12 +144,17 @@ export const useAuthStore = create<AuthState>()(
           getToken: () => useAuthStore.getState().token,
           onUnauthorized: () => useAuthStore.getState().forceLogout("revoked"),
         });
+        const payload = parseJwt(tokenResponse.access_token);
+        const expiresAt = payload?.exp ? payload.exp * 1000 : Date.now() + tokenResponse.expires_in * 1000;
+        const remainingMs = Math.max(0, expiresAt - Date.now());
+
         useAuthStore.setState({
           token: tokenResponse.access_token,
-          tokenExpiresAt: Date.now() + tokenResponse.expires_in * 1000,
+          tokenExpiresAt: expiresAt,
           isAuthenticated: true,
         });
         setAuthCookie(tokenResponse.access_token, tokenResponse.expires_in);
+        scheduleExpiryTimer(remainingMs);
         try {
           const user = await apiClient.get<UserPrivate>("/api/v1/users/me");
           set({ user });
@@ -171,15 +199,21 @@ export const useAuthStore = create<AuthState>()(
       },
 
       adoptToken: (tokenResponse) => {
+        const payload = parseJwt(tokenResponse.access_token);
+        const expiresAt = payload?.exp ? payload.exp * 1000 : Date.now() + tokenResponse.expires_in * 1000;
+        const remainingMs = Math.max(0, expiresAt - Date.now());
+
         set({
           token: tokenResponse.access_token,
-          tokenExpiresAt: Date.now() + tokenResponse.expires_in * 1000,
+          tokenExpiresAt: expiresAt,
           isAuthenticated: true,
         });
         setAuthCookie(tokenResponse.access_token, tokenResponse.expires_in);
+        scheduleExpiryTimer(remainingMs);
       },
 
       clearAuthState: () => {
+        cancelExpiryTimer();
         set({
           token: null,
           tokenExpiresAt: null,
@@ -191,13 +225,12 @@ export const useAuthStore = create<AuthState>()(
 
       rehydrateSession: () => {
         const cookieToken = readAuthCookie();
-        const expiresAt = get().tokenExpiresAt;
-        const remainingS = expiresAt
-          ? Math.floor((expiresAt - Date.now()) / 1000)
-          : 0;
-        if (cookieToken && remainingS > 0) {
-          // Cookie token still within its lifetime — restore the session.
-          set({ token: cookieToken, isAuthenticated: true });
+        if (cookieToken && !isJwtExpired(cookieToken)) {
+          const payload = parseJwt(cookieToken);
+          const expiresAt = payload?.exp ? payload.exp * 1000 : Date.now() + 900 * 1000;
+          const remainingMs = Math.max(0, expiresAt - Date.now());
+          set({ token: cookieToken, tokenExpiresAt: expiresAt, isAuthenticated: true });
+          scheduleExpiryTimer(remainingMs);
         } else {
           // No cookie / expired token: drop any stale persisted profile.
           get().clearAuthState();

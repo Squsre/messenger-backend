@@ -11,7 +11,6 @@ import { Button } from "@/components/ui/button";
 import { useConversationStore } from "@/stores/use-conversation-store";
 import { useAuthStore } from "@/stores/use-auth-store";
 import { useUiStore } from "@/stores/use-ui-store";
-import { UnverifiedEmailSidebarCard } from "@/components/auth/unverified-email-banner";
 import { useTypingUsers } from "@/hooks/use-typing";
 import { cn } from "@/lib/utils";
 import { Loader2 } from "lucide-react";
@@ -218,10 +217,6 @@ export function ChatSidebar() {
   const [query, setQuery] = useState("");
   const [tab, setTab] = useState<"chats" | "groups">("chats");
 
-  // Email-verification nudge lives above the chat list (account-level).
-  const emailVerified = useAuthStore((s) => s.user?.email_verified ?? true);
-  const email = useAuthStore((s) => s.user?.email ?? "");
-
   const conversations = useConversationStore((s) => s.conversations);
   const conversationsLoading = useConversationStore((s) => s.conversationsLoading);
   const conversationsTotal = useConversationStore((s) => s.conversationsTotal);
@@ -347,7 +342,6 @@ export function ChatSidebar() {
             </TabsTrigger>
           </TabsList>
         </Tabs>
-        {!emailVerified && <UnverifiedEmailSidebarCard email={email} />}
       </div>
 
       <ScrollArea className="chat-scroll flex-1 min-h-0">

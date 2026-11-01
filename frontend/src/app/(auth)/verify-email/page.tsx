@@ -58,6 +58,9 @@ function VerifyEmailInner() {
   useEffect(() => {
     if (!linkToken) return;
     form.setValue("token", linkToken);
+    if (typeof window !== "undefined" && window.location.search) {
+      window.history.replaceState({}, "", window.location.pathname);
+    }
     // Defer out of the effect body; the request itself is async anyway.
     const timer = setTimeout(() => void confirmToken(linkToken), 0);
     return () => clearTimeout(timer);
